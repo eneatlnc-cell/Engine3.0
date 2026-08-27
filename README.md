@@ -4,7 +4,7 @@
 > 闭源，端到端加密层在此开源，接受社区审计——加密闭源没有意义，
 > **可验证性才是安全的来源**（Signal 模式）。
 
-License: **AGPL-3.0** · 快照版本: **v3.35.0-audit**
+License: **AGPL-3.0** · 快照版本: **v3.37.0-audit**
 
 ## 本仓库包含什么
 
@@ -12,13 +12,14 @@ License: **AGPL-3.0** · 快照版本: **v3.35.0-audit**
 |---|---|---|
 | `core/core-crypto` | AES-256-GCM 封装、P-256 ECDSA 签名/验签、ECDH 密钥协商、SHA-256 密钥指纹、中继挑战-应答（SignalAuth）、密钥导入导出序列化、本地备份容器格式（PBKDF2 + AES-GCM） | 5 套 |
 | `core/core-protocol` | 消息信封线协议（AAD 绑定双方指纹+序列号防重放）、协议序列化 | 1 套 |
-| `core/core-ipc` | Engine↔Vault 签名回调契约（回调签名规则、错误码、防篡改） | 1 套 |
+| `core/core-ipc` | Engine↔Vault 签名回调契约（回调签名规则、错误码、防篡改；钱包密钥初始化与交易签名请求契约） | 1 套 |
+| `core/core-wallet` | 本地签名账本：交易模型与规范化序列化、域分离签名（SPARK-WALLET-TX-V1）、append-only 哈希链、余额推导、全链验签（重放/回退/断链检出） | 1 套 |
 
 构建要求：**JDK 17**；`core-ipc` 是 Android 契约模块（基于
 `Intent`/`Uri`），需 **Android SDK (platform 34)**，其余模块纯 JVM：
 
 ```bash
-./gradlew test          # 运行全部 7 套测试
+./gradlew test          # 运行全部 8 套测试
 ```
 
 ## 不包含什么（以及为什么）
@@ -39,6 +40,10 @@ License: **AGPL-3.0** · 快照版本: **v3.35.0-audit**
 - **消息零落盘**：客户端不持久化聊天消息（E2EE 之上再加一层数据最小化）
 - **本地备份**：口令派生密钥（PBKDF2-HMAC-SHA256, 350k 迭代）+
   AES-256-GCM，文件头纳入 AAD 防篡改
+- **本地钱包**：余额不是存储的数字，而是 append-only 签名交易历史的
+  推导值——每笔交易由密钥库内的钱包密钥做域分离签名，篡改/删除/
+  重排任何历史记录都会破坏哈希链而被全链验签检出；钱包余额既不
+  上服务端，也不进备份文件
 
 架构与信任域划分详见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 

@@ -42,6 +42,13 @@ object IpcContract {
     const val HOST_SIGN = "sign"
     const val HOST_RESTORE = "restore"
 
+    // ---- v3.37: SPARK 钱包 IPC 入口 ----
+    /** 钱包密钥初始化: Vault 内生成钱包密钥对, 公钥经回调返回 (私钥永不离开 Vault) */
+    const val HOST_WALLET_INIT = "walletinit"
+
+    /** 钱包交易签名: Engine 提交未签名交易 JSON, Vault 确认页渲染后用钱包私钥签名 */
+    const val HOST_SIGN_TX = "signtx"
+
     const val PARAM_SESSION = "session"
     const val PARAM_STATUS = "status"
     const val PARAM_CODE = "code"
@@ -264,4 +271,62 @@ object IpcContract {
     /** 检查 URI 是否为身份恢复请求 */
     fun isRestoreUri(uri: Uri): Boolean =
         uri.scheme == SCHEME && uri.host == HOST_RESTORE
+
+    // ---- v3.37: SPARK 钱包 IPC ----
+
+    /**
+     * v3.37 构建 "钱包密钥初始化" 唤起 URI。
+     *
+     * 场景: Engine 首次使用 SPARK 钱包时调用。Vault 在指纹门后为该应用
+     * 生成**钱包专属密钥对** (与身份密钥完全独立的第二个密钥槽):
+     * - 私钥仅以 Keystore 加密形态存于 Vault, 永不离开 (比身份密钥的
+     *   二维码导入路径更严 —— 钱包密钥连光学通道都不经过);
+     * - 公钥 (X.509 Base64) 经回调 result 送回 Engine, Engine 保存并
+     *   用于此后全部交易签名的验签;
+     * - 幂等: 已有钱包密钥时直接返回既有公钥, 不重新生成。
+     *
+     * 安全模型与 restore 一致: 回调受 ENGINE_CALLBACK signature 权限
+     * 保护 + 身份绑定私钥对 (sessionId ‖ status ‖ ts ‖ result) 签名。
+     */
+    fun buildWalletInitUri(sessionId: String, appPackage: String = ENGINE_PACKAGE): String {
+        return Uri.Builder()
+            .scheme(SCHEME)
+            .authority(HOST_WALLET_INIT)
+            .appendQueryParameter(PARAM_SESSION, sessionId)
+            .appendQueryParameter(PARAM_APP, appPackage)
+            .build()
+            .toString()
+    }
+
+    /** 检查 URI 是否为钱包初始化请求 */
+    fun isWalletInitUri(uri: Uri): Boolean =
+        uri.scheme == SCHEME && uri.host == HOST_WALLET_INIT
+
+    /**
+     * v3.37 构建 "钱包交易签名" 唤起 URI (仅路由字段)。
+     *
+     * 待签交易 (未签名 [com.securesocial.core.wallet.WalletTx] 的 JSON)
+     * 经 Intent Extra (EXTRA_PAYLOAD) 投递 —— 与既有 sign 请求同一
+     * 防日志泄露策略。Vault 解析后在**自己进程渲染的确认页**上展示
+     * 金额/类型/对手方/序号 (Ledger 模式: 主机被攻破也无法骗签),
+     * 生物识别通过后:
+     * 1. 校验 tx.seq > 本地高水位序号 (回滚见证, 旧序号一律拒绝);
+     * 2. 用该应用的钱包私钥对 [com.securesocial.core.wallet.TxCanonical]
+     *    规范化字节签名 (域分离: SPARK-WALLET-TX-V1);
+     * 3. 更新高水位为 tx.seq;
+     * 4. Base64 签名经回调 result 返回。
+     */
+    fun buildSignTxUri(sessionId: String, appPackage: String = ENGINE_PACKAGE): String {
+        return Uri.Builder()
+            .scheme(SCHEME)
+            .authority(HOST_SIGN_TX)
+            .appendQueryParameter(PARAM_SESSION, sessionId)
+            .appendQueryParameter(PARAM_APP, appPackage)
+            .build()
+            .toString()
+    }
+
+    /** 检查 URI 是否为钱包交易签名请求 */
+    fun isSignTxUri(uri: Uri): Boolean =
+        uri.scheme == SCHEME && uri.host == HOST_SIGN_TX
 }

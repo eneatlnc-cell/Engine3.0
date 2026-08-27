@@ -17,7 +17,7 @@
 │ 中继 relay    │  零状态哑管道 · 只转发密文 · 闭源(商业私有化交付物)
 └──────────────┘
 
-  ▓▓ 本仓库 ▓▓ = core-crypto / core-protocol / core-ipc
+  ▓▓ 本仓库 ▓▓ = core-crypto / core-protocol / core-ipc / core-wallet
   （客户端与密钥库共同依赖的协议栈，两侧字节级同步）
 ```
 
@@ -41,12 +41,14 @@
 | 密钥流转 | 密钥对导入导出序列化（跨设备迁移） | `KeyPayloadSerializer` |
 | 本地备份 | PBKDF2-HMAC-SHA256（350k 迭代）口令派生 + AES-256-GCM，明文头入 AAD | `BackupFormat` / `BackupPayload` |
 | 组件间回调 | 回调签名覆盖 sessionId+status+ts+result，防调包 | `IpcContract` |
+| 本地钱包 | append-only 签名交易账本：交易规范化序列化（字段定序）、域分离签名（SPARK-WALLET-TX-V1，与身份签名域不可互换）、prevTxHash 哈希链、余额=历史推导值、全链验签（重放/回退/断链检出） | `WalletTx` / `WalletLedger` |
 
 ## 数据驻留（隐私红线）
 
 | 数据 | 驻留位置 |
 |---|---|
 | 聊天消息 | 仅内存，零落盘 |
-| 联系人 / 标记物 / 余额 / 档案 | 仅本地；备份走用户自持加密文件（`BackupFormat`） |
+| 联系人 / 标记物 | 仅本地；备份走用户自持加密文件（`BackupFormat`） |
+| SPARK 余额 | 仅本地签名账本（`core-wallet`）：余额 = 签名历史推导值，不进备份文件、不上服务端 |
 | 身份私钥 | 仅密钥库，Keystore 加密 |
 | 服务端 | 无任何用户数据；SPARK 计费余额不上服务端（避免以指纹索引的交易图谱） |

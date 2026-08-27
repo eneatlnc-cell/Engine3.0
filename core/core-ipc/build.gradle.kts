@@ -24,6 +24,8 @@ android {
 }
 
 dependencies {
+    // v3.37: IpcSignTxRequest 暴露 WalletTx 类型 (api: 依赖方需可见)
+    api(project(":core:core-wallet"))
     implementation(libs.kotlinx.serialization.json)
     testImplementation(libs.junit)
     // v3.29 (审计 P0-3): IpcContractTest 的端到端验签流程测试需要密码学原语

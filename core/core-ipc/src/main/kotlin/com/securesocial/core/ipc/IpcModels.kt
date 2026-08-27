@@ -16,6 +16,9 @@ enum class IpcErrorCode(val code: String, val description: String) {
     NO_BINDING("NO_BINDING", "Vault 中没有该应用的可恢复身份, 请直接生成新密钥对"),
     SIGN_FAILED("SIGN_FAILED", "签名失败 (载荷格式错误或密码学异常)"),
     SIGN_TIMEOUT("SIGN_TIMEOUT", "签名请求超时 (Vault 未响应)"),
+    NO_WALLET_KEY("NO_WALLET_KEY", "Vault 中没有该应用的钱包密钥, 请先初始化钱包"),
+    TX_FORMAT_ERROR("TX_FORMAT_ERROR", "交易载荷格式错误, 无法解析"),
+    TX_SEQ_REJECTED("TX_SEQ_REJECTED", "交易序号未超过高水位 (检测到账本回滚), 拒绝签名"),
     UNKNOWN_ERROR("UNKNOWN_ERROR", "未知错误");
 
     companion object {
@@ -199,6 +202,102 @@ data class IpcSignRequest(
             // Base64 载荷必须可解码, 拒绝畸形请求
             if (runCatching { java.util.Base64.getDecoder().decode(payload) }.isFailure) return null
             return IpcSignRequest(sessionId, payload)
+        }
+    }
+}
+
+/**
+ * v3.37 · SPARK 钱包初始化请求
+ *
+ * 从 myvault://walletinit URI 解析而来。Vault 在指纹门后为该应用生成
+ * 钱包专属密钥对 (与身份密钥独立的第二个密钥槽), 公钥经回调 result
+ * 返回; 幂等: 已有钱包密钥时直接返回既有公钥。
+ *
+ * 仅含路由字段 (sessionId), 无载荷 Extra —— 钱包密钥对在 Vault 进程内
+ * 生成, Engine 侧不提供任何种子材料 (杜绝弱熵注入)。
+ */
+data class IpcWalletInitRequest(
+    val sessionId: String
+) {
+    companion object {
+        /** 从 Intent 解析钱包初始化请求 */
+        fun fromIntent(intent: Intent): IpcWalletInitRequest? {
+            val uri = intent.data ?: return null
+            return fromUri(uri)
+        }
+
+        /** 从 URI 解析钱包初始化请求 */
+        fun fromUri(uri: Uri): IpcWalletInitRequest? {
+            if (!IpcContract.isWalletInitUri(uri)) return null
+            val sessionId = uri.getQueryParameter(IpcContract.PARAM_SESSION) ?: return null
+            return IpcWalletInitRequest(sessionId)
+        }
+    }
+}
+
+/**
+ * v3.37 · SPARK 钱包交易签名请求
+ *
+ * 从 myvault://signtx URI + Intent Extra 解析而来:
+ * - Engine 构造未签名交易 ([com.securesocial.core.wallet.WalletTx],
+ *   signature = "") 的 JSON, 经 EXTRA_PAYLOAD 投递 (防系统日志泄露,
+ *   与 sign 请求同一策略);
+ * - Vault 在自己进程渲染确认页 (金额/类型/对手方/序号), 生物识别通过后:
+ *   1. 校验 tx.seq > 本地高水位序号 (账本回滚见证, 旧序号一律拒绝);
+ *   2. 用钱包私钥对 TxCanonical 规范化字节签名 (域分离 SPARK-WALLET-TX-V1);
+ *   3. 更新高水位为 tx.seq;
+ *   4. Base64(DER) 签名经回调 result 返回。
+ *
+ * 解析侧强校验 (畸形载荷在入口即拒, 不进签名流程):
+ * - JSON 必须可解码为 WalletTx;
+ * - signature 必须为空串 (已签名交易不接受重签);
+ * - seq/amount 必须 > 0;
+ * - type 必须为已知枚举。
+ *
+ * @param sessionId   会话标识
+ * @param txJson      未签名交易 JSON (EXTRA_PAYLOAD)
+ * @param tx          解析后的未签名交易; 校验失败时为 null
+ */
+data class IpcSignTxRequest(
+    val sessionId: String,
+    val txJson: String,
+    val tx: com.securesocial.core.wallet.WalletTx?
+) {
+    companion object {
+        /**
+         * 从 Intent 解析交易签名请求 (推荐入口)。
+         *
+         * sessionId 读 URI; 交易 JSON 读 EXTRA_PAYLOAD (必填 ——
+         * 钱包签名是 v3.37 新通道, 无旧版 URI 回退路径)。
+         */
+        fun fromIntent(intent: Intent): IpcSignTxRequest? {
+            val uri = intent.data ?: return null
+            if (!IpcContract.isSignTxUri(uri)) return null
+
+            val sessionId = uri.getQueryParameter(IpcContract.PARAM_SESSION) ?: return null
+            val txJson = intent.getStringExtra(IpcContract.EXTRA_PAYLOAD) ?: return null
+            return IpcSignTxRequest(sessionId, txJson, parseTx(txJson))
+        }
+
+        /** 从 URI 解析 (仅 sessionId; 交易 JSON 必须经 Intent Extra, URI 无此参数) */
+        fun fromUri(uri: Uri): IpcSignTxRequest? {
+            if (!IpcContract.isSignTxUri(uri)) return null
+            val sessionId = uri.getQueryParameter(IpcContract.PARAM_SESSION) ?: return null
+            return IpcSignTxRequest(sessionId, "", null)
+        }
+
+        /**
+         * 畸形交易校验: 返回 null 表示载荷不可接受。
+         * 注意: seq 高水位比较在 Vault 的 WalletKeyManager 内完成
+         * (需要读取持久化状态, 非 pure 函数)。
+         */
+        private fun parseTx(txJson: String): com.securesocial.core.wallet.WalletTx? {
+            val tx = com.securesocial.core.wallet.TxJsonCodec.decode(txJson) ?: return null
+            if (tx.signature.isNotEmpty()) return null          // 已签名交易不接受重签
+            if (tx.seq <= 0L) return null                        // 序号非法
+            if (tx.amount <= 0L) return null                     // 金额必须恒正
+            if (tx.prevTxHash.isEmpty() && tx.seq != 1L) return null // 非首笔必须有前向哈希
+            return tx
         }
     }
 }
