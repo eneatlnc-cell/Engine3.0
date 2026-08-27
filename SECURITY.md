@@ -5,7 +5,7 @@
 **请勿通过公开 issue 报告安全漏洞。**
 
 - GitHub 私密安全通告：仓库 Security 标签页 → Report a vulnerability
-- 或联系：security@（正式邮箱待接入，暂以私密通告为准）
+- 或联系：eneatlnc@gmail.com
 
 请包含：影响模块（E2EE 层 / 协议层 / 边界）、复现步骤或 PoC、
 威胁模型假设（攻击者位置：网络 / 本机 / 中继运营方 / 恶意对端）。
