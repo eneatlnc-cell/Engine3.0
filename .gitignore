@@ -1,0 +1,41 @@
+# Gradle
+.gradle/
+build/
+*.apk
+*.aab
+*.dex
+
+# Android
+local.properties
+*.iml
+.idea/
+.DS_Store
+captures/
+.cxx/
+
+# Kotlin
+*.kotlin_metadata
+
+# Misc
+*.log
+*.tmp
+*.swp
+*~
+
+# ── 密钥与证书材料 (v3.29 审计 P1-8: 防误提交) ──
+# 签名密钥库 (Android release / 服务端 TLS)
+*.jks
+*.keystore
+*.bks
+# 证书与私钥
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.der
+# 密钥/机密配置
+secrets.properties
+*.env
+keystore.properties
