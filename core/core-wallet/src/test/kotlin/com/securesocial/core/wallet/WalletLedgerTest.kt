@@ -4,22 +4,28 @@ import com.securesocial.core.crypto.EcdsaOperations
 import java.util.Base64
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * v3.37 · SPARK 钱包账本单测
- *
- * 覆盖: 规范化字节确定性 / 编解码往返 / 全链校验 / 余额推导 /
- * 篡改-删除-回滚-重放四类攻击检出 / 域分离。
+ * SPARK 钱包账本单测
+ * v3.37: 规范化字节 / 编解码往返 / 全链校验 / 余额推导 /
+ *        篡改-删除-回滚-重放四类攻击检出 / 域分离
+ * v3.38: 双账户 (custody/margin) / DEPOSIT-WITHDRAW / 足额规则 /
+ *        HANDOVER 终结语义 / 交接证书验证 / v3.37 链兼容
  */
 class WalletLedgerTest {
 
     /** JUnit4 无 assertIs: 类型断言辅助 */
-    private inline fun <reified T : WalletLedger.ChainCheck> expect(x: WalletLedger.ChainCheck): T {
+    private inline fun <reified T> expectAny(x: Any): T {
         assertTrue("expected ${T::class.simpleName} but was: $x", x is T)
         return x as T
     }
+
+    private inline fun <reified T : WalletLedger.ChainCheck> expect(x: WalletLedger.ChainCheck): T =
+        expectAny<T>(x)
 
     private fun ok(x: WalletLedger.ChainCheck): WalletLedger.ChainCheck.Ok =
         expect<WalletLedger.ChainCheck.Ok>(x)
@@ -91,6 +97,14 @@ class WalletLedgerTest {
         assertEquals(tx, TxJsonCodec.decode(json))
     }
 
+    @Test
+    fun `tx list codec roundtrip for walletstate payload`() {
+        val chain = standardChain()
+        val decoded = TxJsonCodec.decodeList(TxJsonCodec.encodeList(chain))!!
+        assertEquals(chain, decoded)
+        assertNull(TxJsonCodec.decodeList("not-json"))
+    }
+
     // ---- 链校验与余额 ----
 
     @Test
@@ -99,9 +113,11 @@ class WalletLedgerTest {
         val check = ledger.load(standardChain())
         val ok = ok(check)
         assertEquals(4, ok.txCount)
-        // 4500 + 1000 - 30 + 10
-        assertEquals(5480L, ok.balance)
+        // margin: 4500 + 1000 - 30 + 10; custody: 0 (v3.37 链无托管流水)
+        assertEquals(5480L, ok.balances.margin)
+        assertEquals(0L, ok.balances.custody)
         assertEquals(5480L, ledger.balance())
+        assertEquals(WalletBalances(custody = 0, margin = 5480), ledger.balances())
         assertEquals(5L, ledger.nextSeq())
     }
 
@@ -113,6 +129,178 @@ class WalletLedgerTest {
         assertEquals(0L, ledger.balance())
         assertEquals(1L, ledger.nextSeq())
         assertEquals("", ledger.nextPrevHash())
+    }
+
+    // ---- v3.38 双账户: DEPOSIT / WITHDRAW ----
+
+    @Test
+    fun `deposit moves custody to margin`() {
+        // 提回 1000 (margin→custody) → 充值 400 (custody→margin) → 打赏 50
+        val ledger = WalletLedger(pub)
+        val g = signedTx(1, TxType.GENESIS, 4500)
+        val wd = signedTx(2, TxType.WITHDRAW, 1000, memo = "to-custody", prevHash = g.txHash)
+        val dep = signedTx(3, TxType.DEPOSIT, 400, memo = "recharge", prevHash = wd.txHash)
+        val tip = signedTx(4, TxType.SPEND, 50, counterparty = "feed", memo = "tip", prevHash = dep.txHash)
+        val ok = ok(ledger.load(listOf(g, wd, dep, tip)))
+        // custody: 1000 - 400 = 600; margin: 4500 - 1000 + 400 - 50 = 3850
+        assertEquals(WalletBalances(custody = 600, margin = 3850), ok.balances)
+        assertTrue(ledger.canSpend(3850))
+        assertTrue(!ledger.canSpend(3851))
+        assertTrue(ledger.canDeposit(600))
+        assertTrue(!ledger.canDeposit(601))
+    }
+
+    @Test
+    fun `overspend rejected by running-balance rule`() {
+        // 权威记账方从不签超支交易: 链上出现负 margin = 妥协信号 → TAMPERED
+        val g = signedTx(1, TxType.GENESIS, 100)
+        val overspend = signedTx(2, TxType.SPEND, 200, prevHash = g.txHash)
+        val check = WalletLedger(pub).verify(listOf(g, overspend))
+        bad(check)
+    }
+
+    @Test
+    fun `over-deposit rejected by custody rule`() {
+        val g = signedTx(1, TxType.GENESIS, 100)
+        val wd = signedTx(2, TxType.WITHDRAW, 50, prevHash = g.txHash)
+        val overDep = signedTx(3, TxType.DEPOSIT, 80, prevHash = wd.txHash) // custody 只有 50
+        bad(WalletLedger(pub).verify(listOf(g, wd, overDep)))
+    }
+
+    // ---- v3.38 HANDOVER 终结语义 ----
+
+    private fun handoverChain(newPubHex: String): List<WalletTx> {
+        val g = signedTx(1, TxType.GENESIS, 4500)
+        val wd = signedTx(2, TxType.WITHDRAW, 2000, memo = "to-custody", prevHash = g.txHash)
+        val ho = signedTx(3, TxType.HANDOVER, 2000, counterparty = newPubHex, memo = "handover:2000", prevHash = wd.txHash)
+        return listOf(g, wd, ho)
+    }
+
+    @Test
+    fun `handover terminal chain verifies with drained custody`() {
+        val newKp = ecdsa.generateKeyPair()
+        val newPubHex = HandoverCertificate.pubKeyHex(ecdsa.encodePublicKey(newKp.public))
+        val ledger = WalletLedger(pub)
+        val ok = ok(ledger.load(handoverChain(newPubHex)))
+        // custody 全额移交 → 0; margin 2500 不迁移 (可弃)
+        assertEquals(WalletBalances(custody = 0, margin = 2500), ok.balances)
+        assertTrue(ledger.isTerminal())
+        // 终结链不可再追加
+        val extra = signedTx(4, TxType.GRANT, 100, prevHash = ledger.nextPrevHash())
+        bad(ledger.appendTx(extra))
+    }
+
+    @Test
+    fun `tx after handover rejected by verify`() {
+        val newKp = ecdsa.generateKeyPair()
+        val newPubHex = HandoverCertificate.pubKeyHex(ecdsa.encodePublicKey(newKp.public))
+        val chain = handoverChain(newPubHex)
+        val after = signedTx(4, TxType.GRANT, 100, prevHash = chain.last().txHash)
+        bad(WalletLedger(pub).verify(chain + after))
+    }
+
+    @Test
+    fun `handover must drain custody fully`() {
+        val newKp = ecdsa.generateKeyPair()
+        val newPubHex = HandoverCertificate.pubKeyHex(ecdsa.encodePublicKey(newKp.public))
+        val g = signedTx(1, TxType.GENESIS, 4500)
+        val wd = signedTx(2, TxType.WITHDRAW, 2000, prevHash = g.txHash)
+        // custody=2000, 只交 1500 → 残留 500 死账 → 违规
+        val partial = signedTx(3, TxType.HANDOVER, 1500, counterparty = newPubHex, prevHash = wd.txHash)
+        bad(WalletLedger(pub).verify(listOf(g, wd, partial)))
+    }
+
+    @Test
+    fun `handover cannot be first tx`() {
+        val newKp = ecdsa.generateKeyPair()
+        val newPubHex = HandoverCertificate.pubKeyHex(ecdsa.encodePublicKey(newKp.public))
+        val ho = signedTx(1, TxType.HANDOVER, 100, counterparty = newPubHex)
+        bad(WalletLedger(pub).verify(listOf(ho)))
+    }
+
+    // ---- v3.38 交接证书 ----
+
+    private fun buildCertificate(): Pair<HandoverCertificate, ByteArray> {
+        val newKp = ecdsa.generateKeyPair()
+        val newPubX509 = ecdsa.encodePublicKey(newKp.public)
+        val newPubHex = HandoverCertificate.pubKeyHex(newPubX509)
+        val oldPubX509 = ecdsa.encodePublicKey(pub)
+        // 旧链: custody 2000 (与 handoverChain 同构)
+        val g = signedTx(1, TxType.GENESIS, 4500)
+        val wd = signedTx(2, TxType.WITHDRAW, 2000, prevHash = g.txHash)
+        val unsignedHo = HandoverCertificate.buildHandoverTx(
+            custodySnapshot = 2000,
+            newPubKeyHex = newPubHex,
+            seq = 3,
+            prevHash = wd.txHash,
+        )
+        val sig = ecdsa.sign(priv, TxCanonical.bytes(unsignedHo))
+        val hoTx = unsignedHo.copy(signature = Base64.getEncoder().encodeToString(sig))
+        val cert = HandoverCertificate(
+            oldPubKeyB64 = Base64.getEncoder().encodeToString(oldPubX509),
+            newPubKeyB64 = Base64.getEncoder().encodeToString(newPubX509),
+            handoverTx = hoTx,
+        )
+        return cert to newPubX509
+    }
+
+    @Test
+    fun `certificate verifies and yields genesis for new chain`() {
+        val (cert, newPubX509) = buildCertificate()
+        val result = cert.verify(newPubX509)
+        val ok = expectAny<HandoverCertificate.VerifyResult.Ok>(result)
+        assertEquals(2000L, ok.custodyCarried)
+
+        // 新链 GENESIS 承接 (新密钥签名 — 由新机 WalletKeyManager 完成, 此处验证结构)
+        val genesis = HandoverCertificate.buildGenesisTx(
+            custodyCarried = ok.custodyCarried,
+            oldPubKeyHex = cert.oldPubKeyHex()!!,
+            handoverTxHash = ok.handoverTxHash,
+        )
+        assertEquals(TxType.GENESIS, genesis.type)
+        assertEquals(2000L, genesis.amount)
+        assertEquals(1L, genesis.seq)
+        assertTrue(genesis.memo!!.contains(ok.handoverTxHash.take(16)))
+
+        // v2 规则: 交接承接 GENESIS 允许携带 counterparty (旧公钥 hex)
+        val newKp2 = ecdsa.generateKeyPair()
+        val sig2 = ecdsa.sign(newKp2.private, TxCanonical.bytes(genesis))
+        val signed = genesis.copy(signature = Base64.getEncoder().encodeToString(sig2))
+        val newLedger = WalletLedger(newKp2.public)
+        val newCheck = ok(newLedger.load(listOf(signed)))
+        // GENESIS 双语义 (v3.38 定稿): 承接链的 custody 全额落地托管,
+        // margin 为 0 —— 储蓄迁移后仍是储蓄, 消费需先充值 (DEPOSIT)
+        assertEquals(WalletBalances(custody = 2000, margin = 0), newCheck.balances)
+        assertEquals(WalletBalances(custody = 2000, margin = 0), newLedger.balances())
+        assertTrue(newLedger.canDeposit(2000))
+        assertTrue(!newLedger.canSpend(1)) // margin 0: 承接未充值不可消费
+    }
+
+    @Test
+    fun `certificate encode-decode roundtrip`() {
+        val (cert, _) = buildCertificate()
+        val decoded = HandoverCertificate.decode(HandoverCertificate.encode(cert))
+        assertNotNull(decoded)
+        assertEquals(cert, decoded)
+        assertNull(HandoverCertificate.decode("garbage"))
+    }
+
+    @Test
+    fun `certificate bound to different device rejected`() {
+        // 证书被拍照转发到另一台设备: 该设备的新公钥 ≠ 证书 counterparty → 拒绝
+        val (cert, _) = buildCertificate()
+        val otherKp = ecdsa.generateKeyPair()
+        val otherPub = ecdsa.encodePublicKey(otherKp.public)
+        val result = cert.verify(otherPub)
+        expectAny<HandoverCertificate.VerifyResult.Bad>(result)
+    }
+
+    @Test
+    fun `tampered certificate signature rejected`() {
+        val (cert, newPubX509) = buildCertificate()
+        val tamperedTx = cert.handoverTx.copy(amount = 999999) // 改金额不重签
+        val tampered = cert.copy(handoverTx = tamperedTx)
+        expectAny<HandoverCertificate.VerifyResult.Bad>(tampered.verify(newPubX509))
     }
 
     // ---- 攻击面: 篡改 ----
@@ -139,7 +327,7 @@ class WalletLedgerTest {
 
     @Test
     fun `deleted middle tx detected by broken prevHash link`() {
-        // v3.37 序号间隙合法化后, 抽掉中段交易的检出依据是 prevHash 链断裂
+        // 序号间隙合法化后, 抽掉中段交易的检出依据是 prevHash 链断裂
         // (被删交易的后继 prevTxHash 指向已不存在的交易哈希), 不再是序号缺口。
         val chain = standardChain()
         val check = WalletLedger(pub).verify(chain.filterIndexed { i, _ -> i != 1 })
@@ -151,14 +339,14 @@ class WalletLedgerTest {
     @Test
     fun `seq gap is legal - burned seq after lost callback`() {
         // 场景: seq 3 的交易已获 Vault 签名但回调丢失 (HWM=3 烧毁),
-        // Engine 跳号续链: seq 4 直接接在 seq 2 之后, prevHash 正确链接。
+        // 镜像侧跳号续链: seq 4 直接接在 seq 2 之后, prevHash 正确链接。
         // 严格 +1 规则会把这种可用性恢复判为 TAMPERED —— 定稿为间隙合法。
         val g = signedTx(1, TxType.GENESIS, 4500)
         val grant = signedTx(2, TxType.GRANT, 1000, prevHash = g.txHash)
         val afterBurn = signedTx(4, TxType.SPEND, 30, memo = "burned-3-recovered", prevHash = grant.txHash)
         val ledger = WalletLedger(pub)
         val ok = ok(ledger.load(listOf(g, grant, afterBurn)))
-        assertEquals(5470L, ok.balance)
+        assertEquals(5470L, ok.balances.margin)
         assertEquals(5L, ledger.nextSeq())
     }
 
@@ -181,7 +369,7 @@ class WalletLedgerTest {
         val chain = standardChain()
         val truncated = chain.take(2) // 裁掉 spend, 余额 5500 > 真实 5480
         val ok = ok(WalletLedger(pub).verify(truncated))
-        assertEquals(5500L, ok.balance)
+        assertEquals(5500L, ok.balances.margin)
     }
 
     // ---- 攻击面: 重放 ----
@@ -202,7 +390,7 @@ class WalletLedgerTest {
         ledger.load(standardChain())
         val next = signedTx(5, TxType.SPEND, 8, memo = "msg", prevHash = ledger.nextPrevHash())
         val ok = ok(ledger.appendTx(next))
-        assertEquals(5472L, ok.balance)
+        assertEquals(5472L, ok.balances.margin)
         assertEquals(5, ledger.txs.size)
     }
 
@@ -216,8 +404,9 @@ class WalletLedgerTest {
     }
 
     @Test
-    fun `genesis with counterparty rejected`() {
-        val g = signedTx(1, TxType.GENESIS, 100, counterparty = "peer")
+    fun `grant with counterparty rejected`() {
+        // GRANT (系统赠金) 无对手方; GENESIS 例外 — 交接承接携带旧公钥 hex
+        val g = signedTx(1, TxType.GRANT, 100, counterparty = "peer")
         bad(WalletLedger(pub).verify(listOf(g)))
     }
 
@@ -231,6 +420,20 @@ class WalletLedgerTest {
         assertEquals(WalletLedger.Status.TAMPERED, ledger.status)
         val next = signedTx(9, TxType.SPEND, 1, prevHash = ledger.nextPrevHash())
         bad(ledger.appendTx(next))
+    }
+
+    // ---- v3.37 链兼容 (升级零重签) ----
+
+    @Test
+    fun `v3_37 chain verifies under v3_38 rules unchanged`() {
+        // v3.37 生产链 = GENESIS/GRANT/RECEIVE/SPEND 的任意组合。
+        // v3.38 新增规则 (足额/终结) 对其零影响: 足额规则下 v3.37 链
+        // 的运行 margin 恒 ≥ 0 (Engine 门禁保证), custody 恒为 0。
+        val ledger = WalletLedger(pub)
+        val ok = ok(ledger.load(standardChain()))
+        assertEquals(5480L, ok.balances.margin)
+        assertEquals(0L, ok.balances.custody)
+        assertTrue(!ledger.isTerminal())
     }
 
     private fun ledgerHash(chain: List<WalletTx>): String = chain.last().txHash

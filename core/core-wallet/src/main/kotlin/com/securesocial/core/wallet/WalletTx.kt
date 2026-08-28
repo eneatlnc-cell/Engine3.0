@@ -7,7 +7,8 @@ import java.util.Base64
 
 /**
  * ═══════════════════════════════════════════════════════════════════
- *  v3.37 · SPARK 本地钱包 — 交易模型与规范化序列化 (纯 Kotlin)
+ *  SPARK 本地钱包 — 交易模型与规范化序列化 (纯 Kotlin)
+ *  v3.37: 签名账本基础 · v3.38: 双账户模型 + 交接协议
  * ═══════════════════════════════════════════════════════════════════
  *
  *  设计核心: **余额不是存储值, 是签名历史的推导值** (比特币钱包模型):
@@ -16,29 +17,69 @@ import java.util.Base64
  *  · 删除/回滚任意中段交易, prevTxHash 链与序号连续性双双断裂;
  *  · 任何人持有钱包公钥即可独立验证整条链 (无需信任设备本地存储)。
  *
+ *  v3.38 双账户 (交易所式):
+ *  · custody (托管) — 钱包主账本余额, 由 Vault 权威记账; 外部获得的
+ *    SPARK 与未来购买通道入账于此; 换机时随交接证书迁移;
+ *  · margin (保证金) — Engine 侧可用余额 (消息计费/打赏/密封支付),
+ *    收入直达 (B 方案, 零摩擦), 经 DEPOSIT 从 custody 充值获得;
+ *    换机不迁移 (可弃设计, 丢了就再充)。
+ *
+ *  GENESIS 的双语义 (v3.38 定稿, 按 counterparty 判别):
+ *  · counterparty == null — 旧明文余额迁移 / 钱包重置承接:
+ *    金额直达 margin (历史余额本就是可用形态, 保持 v3.37 行为);
+ *  · counterparty != null — 换机交接承接 (counterparty = 旧公钥 hex):
+ *    金额入 **custody** —— 旧机的托管储蓄迁移后仍是托管储蓄,
+ *    不会静默变成可热支付的 margin (托管 = 绝对安全层的定位)。
+ *
  *  与消息计费 (SparkEconomy) 的关系: 本模块只管"账", 不管"价" ——
  *  定价规则仍在 core-protocol; 钱包层接收任意 amount 并记账。
  *
- *  v3.37 边界 (诚实声明, v3.38+ 由 spark-ledger 解决):
+ *  诚实边界 (v3.38, spark-ledger 上线前):
  *  · RECEIVE/GRANT 为自记账 (自签 = 防篡改, 不证明对手方确实付款);
  *  · 双花 (隐藏另一条日志) 本地无法根除 —— 对手方验证通道未接入;
- *  · Vault 侧高水位序号 (core-ipc signtx) 挡"恢复旧备份重放余额",
- *    但 root 级攻击者仍可同时清写两侧存储 (TEE 保密钥, 不保存储)。
+ *  · Vault 侧权威账本 + 高水位序号挡"恢复旧备份重放余额",
+ *    但 root 级攻击者仍可同时清写两侧存储 (TEE 保密钥, 不保存储);
+ *  · 交接 (HANDOVER) 为单方终结语义: 新链不回指旧链的历史, 旧链
+ *    在交接后不可再续签 (Vault 清除密钥), 双活窗口见 HandoverCertificate。
  */
 
 /** 交易类型 */
 enum class TxType {
-    /** 一次性迁移: 旧明文余额 → 签名账本 (必须是链上第一笔) */
+    /** 一次性迁移: 旧明文余额 → 签名账本 (必须是链上第一笔); v3.38 交接承接亦用此类型 */
     GENESIS,
 
-    /** 每日登录赠金入账 (自记账) */
+    /** 每日登录赠金入账 (自记账, 直达 margin) */
     GRANT,
 
-    /** 支出: 消息计费 / 打赏 / 密封支付 / 未来转账出账 */
+    /** 支出: 消息计费 / 打赏 / 密封支付 (扣 margin) */
     SPEND,
 
-    /** 收入: 被打赏 / 收到礼物 / 密封支付入账 (自记账) */
+    /** 收入: 被打赏 / 收到礼物 / 密封支付入账 (自记账, 直达 margin) */
     RECEIVE,
+
+    /** 充值: custody → margin (交易所式充值, 扣 custody 入 margin) */
+    DEPOSIT,
+
+    /** 提回: margin → custody (预留, 本版仅定义语义不提供 UI) */
+    WITHDRAW,
+
+    /**
+     * 钱包交接: 旧密钥签署的终结交易, 把全部 custody 移交新公钥。
+     * 必须是链上最后一笔 (其后不可再有任何交易); amount 必须 == 交接
+     * 时点的 custody 余额 (全额移交); counterparty = 新公钥 hex。
+     */
+    HANDOVER,
+}
+
+/** 双账户余额快照 (推导值) */
+data class WalletBalances(
+    /** 托管余额 (钱包主账本, 换机可迁移) */
+    val custody: Long,
+    /** 保证金余额 (Engine 侧可用, 计费/打赏/密封支付的资金池) */
+    val margin: Long,
+) {
+    operator fun plus(other: WalletBalances): WalletBalances =
+        WalletBalances(custody + other.custody, margin + other.margin)
 }
 
 /**
@@ -47,10 +88,10 @@ enum class TxType {
  * 与 JSON 序列化的字段顺序/空白完全无关 —— 签名永不因
  * 序列化抖动而失效)。
  *
- * @param seq          链内序号, 严格 +1 递增, 首笔为 1 (缺口 = 删除痕迹)
- * @param amount       金额, 恒正 (方向由 [type] 决定)
- * @param counterparty 对手方指纹 (hex); 计费类支出与赠金为 null
- * @param memo         业务线索 ("daily-grant:2026-08-27" / "msg×5" / "tip:a1b2c3d4")
+ * @param seq          链内序号, 严格递增, 首笔 ≥ 1 (缺口 = 烧号痕迹, 见 WalletLedger)
+ * @param amount       金额, 恒正 (方向与账户由 [type] 决定, 见 [effects])
+ * @param counterparty 对手方指纹 (hex); HANDOVER 时为新公钥 hex; GENESIS(交接承接)时为旧公钥 hex
+ * @param memo         业务线索 ("daily-grant:2026-08-27" / "msg×5" / "tip:a1b2c3d4" / "handover:1:<hash>")
  * @param prevTxHash   前一笔交易的 [WalletTx.txHash]; 首笔为 ""
  * @param signature    Base64(DER ECDSA-P256) 对 [TxCanonical.bytes] 的签名
  */
@@ -69,12 +110,41 @@ data class WalletTx(
     val txHash: String
         get() = TxCanonical.txHash(this)
 
-    /** 交易对余额的方向贡献 */
-    val signedAmount: Long
-        get() = when (type) {
-            TxType.GENESIS, TxType.GRANT, TxType.RECEIVE -> amount
-            TxType.SPEND -> -amount
-        }
+    /**
+     * 双账户效果 (v3.38):
+     *
+     * | type          | custody | margin |
+     * |---------------|---------|--------|
+     * | GENESIS(迁移) | 0       | +a     |  counterparty == null
+     * | GENESIS(承接) | +a      | 0      |  counterparty != null (换机交接)
+     * | GRANT         | 0       | +a     |
+     * | RECEIVE       | 0       | +a     |
+     * | SPEND         | 0       | −a     |
+     * | DEPOSIT       | −a      | +a     |
+     * | WITHDRAW      | +a      | −a     |
+     * | HANDOVER      | −a      | 0      |
+     */
+    fun effects(): WalletBalances = WalletBalances(
+        custody = when (type) {
+            TxType.DEPOSIT, TxType.HANDOVER -> -amount
+            TxType.WITHDRAW -> amount
+            // 交接承接 GENESIS: 旧机 custody 迁移落地仍是 custody
+            TxType.GENESIS -> if (counterparty != null) amount else 0L
+            else -> 0L
+        },
+        margin = when (type) {
+            TxType.GRANT, TxType.RECEIVE -> amount
+            TxType.SPEND, TxType.WITHDRAW -> -amount
+            TxType.DEPOSIT -> amount
+            TxType.HANDOVER -> 0L
+            // 迁移 GENESIS (无 counterparty): 旧明文余额直达可用
+            TxType.GENESIS -> if (counterparty == null) amount else 0L
+        },
+    )
+
+    /** margin 侧是否为入账 (确认页方向图标用) */
+    val isMarginIncoming: Boolean
+        get() = effects().margin > 0L
 }
 
 /**
@@ -93,6 +163,10 @@ data class WalletTx(
  * ```
  * 签名域前缀与既有 "SIGNAL-V1" / "RELAY-AUTH-V1" 互斥 ——
  * 身份域签名绝不可能被重放为钱包交易签名 (跨协议重放防护)。
+ *
+ * v3.38 兼容性: 帧格式**未变** —— 新交易类型只是新的类型名字符串
+ * (长度前缀设计), v3.37 已签交易的规范化字节与其签名保持逐字节
+ * 稳定, 升级不触发任何重签。
  */
 object TxCanonical {
 
@@ -168,5 +242,13 @@ object TxJsonCodec {
 
     fun decode(s: String): WalletTx? = runCatching {
         json.decodeFromString(WalletTx.serializer(), s)
+    }.getOrNull()
+
+    /** 交易列表 (JSONL 落盘 / walletstate 回调载荷) */
+    fun encodeList(txs: List<WalletTx>): String =
+        json.encodeToString(kotlinx.serialization.builtins.ListSerializer(WalletTx.serializer()), txs)
+
+    fun decodeList(s: String): List<WalletTx>? = runCatching {
+        json.decodeFromString(kotlinx.serialization.builtins.ListSerializer(WalletTx.serializer()), s)
     }.getOrNull()
 }
