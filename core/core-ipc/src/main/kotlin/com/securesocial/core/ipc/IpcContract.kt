@@ -174,6 +174,16 @@ object IpcContract {
     const val EXTRA_RESULT = "extra_result"
 
     /**
+     * v3.40 Binder 通道请求标识。
+     *
+     * Vault 的 VaultIpcService 以应用内 Intent 启动 IPC 入口 Activity 时
+     * 附带本标识; Activity 完成时据此经 Service 的 pending 注册表把签名
+     * 回调直送 Engine (Binder), 取代 Vault→Engine 的跨应用跳转。
+     * 缺失时走旧 IpcReceiver.sendCallback 通道 (兼容旧版 Engine 直唤)。
+     */
+    const val EXTRA_BINDER_REQUEST_ID = "extra_binder_request_id"
+
+    /**
      * 构建回调签名内容: sessionId ‖ status ‖ ts ‖ result (均 UTF-8 字节顺序拼接)
      *
      * Vault 对该内容做 ECDSA P-256 签名后经 Intent Extra 附在回调中,

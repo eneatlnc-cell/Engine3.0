@@ -4,15 +4,15 @@
 > 闭源，端到端加密层在此开源，接受社区审计——加密闭源没有意义，
 > **可验证性才是安全的来源**（Signal 模式）。
 
-License: **AGPL-3.0** · 快照版本: **v3.39.0-audit**
+License: **AGPL-3.0** · 快照版本: **v3.40.1-audit**
 
 ## 本仓库包含什么
 
 | 模块 | 内容 | 测试 |
 |---|---|---|
 | `core/core-crypto` | AES-256-GCM 封装、P-256 ECDSA 签名/验签、ECDH 密钥协商、SHA-256 密钥指纹、中继挑战-应答（SignalAuth）、密钥导入导出序列化、本地备份容器格式（PBKDF2 + AES-GCM） | 5 套 |
-| `core/core-protocol` | 消息信封线协议（AAD 绑定双方指纹+序列号防重放）、协议序列化 | 1 套 |
-| `core/core-ipc` | Engine↔Vault 签名回调契约（回调签名规则、错误码、防篡改；钱包密钥初始化/交易签名/总额足额校验/账本对账摘要/全链拉取（full=1）/每日赠金幂等标记/交接承接请求契约） | 1 套 |
+| `core/core-protocol` | 消息信封线协议（AAD 绑定双方指纹+序列号防重放）、协议序列化、Spark 账本协议（SPARK-V1 HTTP 签名内容、计量常量、错误码与请求模型） | 1 套 |
+| `core/core-ipc` | Engine↔Vault 签名回调契约（回调签名规则、错误码、防篡改；钱包密钥初始化/交易签名/总额足额校验/账本对账摘要/全链拉取（full=1）/每日赠金幂等标记/交接承接请求契约）、v3.40 Binder 直连通道契约（事务描述符逐字节一致、signature 权限保护绑定、回调注册表、旧 Activity 跳转通道回退） | 1 套 |
 | `core/core-wallet` | 本地签名账本：交易模型与规范化序列化、域分离签名（SPARK-WALLET-TX-V1）、append-only 哈希链、单一可用余额推导（total，v3.39 合并双账户；旧链 custody/margin 分量仍可推导）、全链验签（重放/回退/断链检出）、钱包交接协议（HANDOVER 终结交易 + 交接证书 + 承接 GENESIS） | 1 套 |
 
 构建要求：**JDK 17**；`core-ipc` 是 Android 契约模块（基于
@@ -59,6 +59,13 @@ License: **AGPL-3.0** · 快照版本: **v3.39.0-audit**
   终结交易移交全部余额（v3.39 起为 total 全额；此后旧链不可再续签），
   新机凭交接证书验证旧密钥签名后以 GENESIS 承接；交接证书防调包
   （新公钥绑定于旧密钥签名之内）
+- **Binder IPC 直连（v3.40）**：Engine↔Vault 通信从跨应用跳转升级为
+  signature 级权限保护的 Binder 直连通道——绑定行为不触发任何用户
+  确认弹窗（部分 ROM 对跨应用跳转一律弹确认框，旧通道每轮签名要弹
+  2 次，静默对账轮询时尤甚）；请求经 Binder 投递、回调经 Binder 直送
+  Engine 进程。密码学契约原样复用（回调验签、result 纳入签名范围），
+  只换投递方式不弱化安全；旧 Activity 跳转通道保留为自动回退，
+  双端可独立升级
 
 架构与信任域划分详见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
