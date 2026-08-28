@@ -17,7 +17,18 @@ import java.util.Base64
  *  · 删除/回滚任意中段交易, prevTxHash 链与序号连续性双双断裂;
  *  · 任何人持有钱包公钥即可独立验证整条链 (无需信任设备本地存储)。
  *
- *  v3.38 双账户 (交易所式):
+ *  v3.39 单账户合并 (用户定稿): SPARK 后期可交易可兑换, 托管/可用
+ *  双账户区分不再有意义 —— **余额 = custody + margin (total)**, 统一
+ *  呈现为 "可用余额"。
+ *  · 兼容性: effects() 的双账户向量保留 (旧链交易的验签与推导依赖
+ *    既有字节语义, 不可变更); 新交易照常记账, 只是展示与足额判断
+ *    一律取 [WalletBalances.total];
+ *  · DEPOSIT/WITHDRAW (账户内划转) 的 total 效果为 0 —— 合并后不再
+ *    产生新划转交易, 旧链上的划转对 total 无影响, 天然兼容;
+ *  · 足额与校验规则同步改为 "total 运行余额恒 ≥ 0" (旧链的双账户
+ *    分量均非负 → total 必然非负, 升级不破坏任何已签链)。
+ *
+ *  v3.38 双账户 (交易所式, 历史语义, 仅旧链推导使用):
  *  · custody (托管) — 钱包主账本余额, 由 Vault 权威记账; 外部获得的
  *    SPARK 与未来购买通道入账于此; 换机时随交接证书迁移;
  *  · margin (保证金) — Engine 侧可用余额 (消息计费/打赏/密封支付),
@@ -57,29 +68,60 @@ enum class TxType {
     /** 收入: 被打赏 / 收到礼物 / 密封支付入账 (自记账, 直达 margin) */
     RECEIVE,
 
-    /** 充值: custody → margin (交易所式充值, 扣 custody 入 margin) */
+    /** 充值: custody → margin (v3.38 划转; v3.39 起不再产生新交易, 仅旧链推导) */
     DEPOSIT,
 
-    /** 提回: margin → custody (预留, 本版仅定义语义不提供 UI) */
+    /** 提回: margin → custody (v3.38 预留; v3.39 起同 DEPOSIT, 仅旧链推导) */
     WITHDRAW,
 
     /**
-     * 钱包交接: 旧密钥签署的终结交易, 把全部 custody 移交新公钥。
+     * 钱包交接: 旧密钥签署的终结交易, 把全部余额 (v3.39: total) 移交新公钥。
      * 必须是链上最后一笔 (其后不可再有任何交易); amount 必须 == 交接
-     * 时点的 custody 余额 (全额移交); counterparty = 新公钥 hex。
+     * 时点的 total 余额 (全额移交); counterparty = 新公钥 hex。
      */
     HANDOVER,
 }
 
-/** 双账户余额快照 (推导值) */
+/**
+ * 双账户余额快照 (推导值)。
+ *
+ * v3.39: 对外余额语义统一为 [total] (custody + margin) —— 单一可用余额;
+ * custody/margin 分量仅为旧链 (v3.38 划转交易) 推导保留, 新代码不消费。
+ */
 data class WalletBalances(
-    /** 托管余额 (钱包主账本, 换机可迁移) */
+    /** 托管余额 (v3.38 历史语义; 旧链推导保留) */
     val custody: Long,
-    /** 保证金余额 (Engine 侧可用, 计费/打赏/密封支付的资金池) */
+    /** 保证金余额 (v3.38 历史语义; 旧链推导保留) */
     val margin: Long,
 ) {
+    /** 可用余额 (v3.39 合并语义): 托管 + 可用的总和 */
+    val total: Long get() = custody + margin
+
     operator fun plus(other: WalletBalances): WalletBalances =
         WalletBalances(custody + other.custody, margin + other.margin)
+}
+
+/**
+ * 每日登录赠金约定 (v3.39 提升为两 App 共用契约):
+ * · Engine (SparkWalletManager) 生成 GRANT 交易时 memo = "daily-grant:<yyyy-MM-dd>";
+ * · Vault (WalletKeyManager) 以同一约定扫描权威账本做**每日幂等**判定
+ *   (卸载重装 Engine 不再重复领取 —— 账本为准, 不依赖 Engine 本地标记)。
+ * · 两侧同设备同时区, 日期口径天然一致。
+ */
+object WalletGrant {
+    /** 每日赠金 memo 前缀; 完整格式 "daily-grant:<yyyy-MM-dd>" */
+    const val MEMO_PREFIX = "daily-grant:"
+
+    /** 生成指定时刻所在日的赠金 memo (yyyy-MM-dd, 设备本地时区) */
+    fun memoForDate(epochMillis: Long = System.currentTimeMillis()): String {
+        val fmt = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+        fmt.timeZone = java.util.TimeZone.getDefault()
+        return MEMO_PREFIX + fmt.format(java.util.Date(epochMillis))
+    }
+
+    /** memo 是否为指定时刻所在日的赠金 (幂等判定) */
+    fun isGrantMemoForDate(memo: String?, epochMillis: Long = System.currentTimeMillis()): Boolean =
+        memo != null && memo == memoForDate(epochMillis)
 }
 
 /**
@@ -142,9 +184,9 @@ data class WalletTx(
         },
     )
 
-    /** margin 侧是否为入账 (确认页方向图标用) */
-    val isMarginIncoming: Boolean
-        get() = effects().margin > 0L
+    /** total 侧是否为入账 (v3.39; 确认页方向图标用) */
+    val isIncoming: Boolean
+        get() = effects().total > 0L
 }
 
 /**

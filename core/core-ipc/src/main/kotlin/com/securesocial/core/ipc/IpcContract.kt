@@ -66,10 +66,13 @@ object IpcContract {
     const val HOST_WALLET_STATE = "walletstate"
 
     /**
-     * 充值签名 (custody → margin): DEPOSIT 交易的专用入口。与 signtx
-     * 载荷同构 (未签名交易 JSON via EXTRA_PAYLOAD), 但入口强校验
-     * type == DEPOSIT, Vault 侧路由到充值确认页 (DepositActivity)。
-     * 签名前 Vault 用**权威账本**做 custody 足额校验 (关盲签缺口)。
+     * 充值签名 (custody → margin): DEPOSIT 交易的专用入口。
+     *
+     * @deprecated v3.39 双账户合并 (custody/margin 统一为可用余额 total)
+     * 后, 账户内划转不再有意义 —— 本入口从 Vault 侧移除 (Manifest 注销 +
+     * 路由删除), Engine 侧不再调用。常量保留仅为旧版本混布期的错误
+     * 路由诊断 (对旧 Vault 发起 deposit 会得到 ActivityNotFound,
+     * Engine 应捕获并引导升级)。
      */
     const val HOST_DEPOSIT = "deposit"
 
@@ -110,6 +113,9 @@ object IpcContract {
     const val PARAM_TS = "ts"
     const val PARAM_SIG = "sig"
     const val PARAM_APP = "app"
+
+    /** v3.39: walletstate 全链拉取开关 (full=1 → 应答携带 chainJson) */
+    const val PARAM_FULL = "full"
 
     const val STATUS_SUCCESS = "success"
     const val STATUS_FAIL = "fail"
@@ -396,16 +402,29 @@ object IpcContract {
      * - terminal == true → 本地钱包已交接终结, Engine 锁定钱包 UI
      *   并引导 "此设备钱包已迁出" 文案。
      *
-     * 无载荷 Extra (纯查询); Vault 免指纹直接应答 (摘要非秘密材料,
-     * 入口受 signature 权限保护)。钱包未初始化时回调
+     * v3.39 新增 [full] 参数 (full=1):
+     * - 应答在摘要之外携带**完整已签名链** (chainJson) —— Engine 重装/
+     *   清数据后镜像为空, 或镜像与权威链分叉 (tipHash 不一致) 时,
+     *   一次对账即完成全量重建, 从根上终结 "seq 拒绝 → 重试 → 弹框"
+     *   的死循环;
+     * - 应答同时携带 grantClaimedToday (权威账本当日 GRANT 幂等标记),
+     *   Engine 据此决定是否发起每日赠金 —— 卸载重装不再重复赠送。
+     *
+     * 无载荷 Extra (纯查询); Vault 免指纹直接应答 (摘要与已签名链均
+     * 非秘密材料, 入口受 signature 权限保护)。钱包未初始化时回调
      * NO_WALLET_KEY 失败码 (Engine 据此引导初始化)。
      */
-    fun buildWalletStateUri(sessionId: String, appPackage: String = ENGINE_PACKAGE): String {
+    fun buildWalletStateUri(
+        sessionId: String,
+        appPackage: String = ENGINE_PACKAGE,
+        full: Boolean = false,
+    ): String {
         return Uri.Builder()
             .scheme(SCHEME)
             .authority(HOST_WALLET_STATE)
             .appendQueryParameter(PARAM_SESSION, sessionId)
             .appendQueryParameter(PARAM_APP, appPackage)
+            .apply { if (full) appendQueryParameter(PARAM_FULL, "1") }
             .build()
             .toString()
     }

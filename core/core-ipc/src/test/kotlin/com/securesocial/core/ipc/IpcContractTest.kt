@@ -120,6 +120,9 @@ class IpcContractTest {
             IpcErrorCode.WALLET_TERMINAL to "WALLET_TERMINAL",
             IpcErrorCode.WALLET_ALREADY_INITIALIZED to "WALLET_ALREADY_INITIALIZED",
             IpcErrorCode.HANDOVER_CERT_INVALID to "HANDOVER_CERT_INVALID",
+            // v3.39: 赠金幂等 + 总额足额
+            IpcErrorCode.GRANT_ALREADY_CLAIMED to "GRANT_ALREADY_CLAIMED",
+            IpcErrorCode.INSUFFICIENT_TOTAL to "INSUFFICIENT_TOTAL",
         )
         for ((code, raw) in pairs) {
             assertEquals(raw, code.code)
@@ -133,6 +136,7 @@ class IpcContractTest {
         // 对账摘要编解码闭环: 余额/高水位/尾哈希/终结态不丢字段
         val state = IpcWalletState(
             initialized = true,
+            total = 4450L,
             custody = 600L,
             margin = 3850L,
             highWaterSeq = 4L,
@@ -140,8 +144,9 @@ class IpcContractTest {
             terminal = false,
             txCount = 4L,
         )
-        val decoded = IpcWalletState.decode(IpcWalletState.encode(state))
+        val decoded = IpcWalletState.decode(IpcWalletState.encode(state))!!
         assertEquals(state, decoded)
+        assertEquals(4450L, decoded.total)
 
         // v3.38 镜像追赶: 尾交易 JSON 一并往返 (Engine 丢回调后拉取续链)
         val tip = com.securesocial.core.wallet.WalletTx(
@@ -158,15 +163,64 @@ class IpcContractTest {
     }
 
     @Test
+    fun `walletstate v3_39 grant and chain fields round-trip`() {
+        // full=1 应答: 每日赠金幂等标记 + 完整链 JSON (Engine 全量重建通道)
+        val chain = listOf(
+            com.securesocial.core.wallet.WalletTx(
+                seq = 1L, type = com.securesocial.core.wallet.TxType.GENESIS, amount = 4500L,
+                counterparty = null, memo = null, timestamp = 1L,
+                prevTxHash = "", signature = "sig1",
+            ),
+            com.securesocial.core.wallet.WalletTx(
+                seq = 2L, type = com.securesocial.core.wallet.TxType.GRANT, amount = 1000L,
+                counterparty = null, memo = "daily-grant:2026-08-28", timestamp = 2L,
+                prevTxHash = "h1", signature = "sig2",
+            ),
+        )
+        val state = IpcWalletState(
+            initialized = true,
+            total = 5500L,
+            highWaterSeq = 2L,
+            tipHash = "h2",
+            txCount = 2L,
+            grantClaimedToday = true,
+            chainJson = com.securesocial.core.wallet.TxJsonCodec.encodeList(chain),
+        )
+        val decoded = IpcWalletState.decode(IpcWalletState.encode(state))!!
+        assertEquals(true, decoded.grantClaimedToday)
+        assertEquals(chain, com.securesocial.core.wallet.TxJsonCodec.decodeList(decoded.chainJson!!))
+        // 默认应答 (旧版 Vault 兼容): grantClaimedToday=false, chainJson=null
+        val legacy = IpcWalletState.decode(IpcWalletState.encode(IpcWalletState(initialized = true)))!!
+        assertEquals(false, legacy.grantClaimedToday)
+        assertEquals(null, legacy.chainJson)
+    }
+
+    @Test
+    fun `walletstate request parses full flag`() {
+        // URI 构建属 Android 集成测试范畴; 本测锚定纯参数语义 (v3.39)
+        val plain = IpcWalletStateRequest.fromParams(sessionId = "s1", full = null)!!
+        assertEquals(false, plain.full)
+        val full = IpcWalletStateRequest.fromParams(sessionId = "s1", full = "1")!!
+        assertEquals(true, full.full)
+        // full 语义严格: 非 "1" 值一律视为非全量
+        assertEquals(false, IpcWalletStateRequest.fromParams("s1", "0")!!.full)
+        assertEquals(false, IpcWalletStateRequest.fromParams("s1", "true")!!.full)
+        // sessionId 缺失 → 整体拒绝
+        assertEquals(null, IpcWalletStateRequest.fromParams(null, "1"))
+    }
+
+    @Test
     fun `walletstate defaults for uninitialized wallet`() {
         // 未初始化: 其余字段全默认 (Engine 据此引导 walletinit)
         val decoded = IpcWalletState.decode(IpcWalletState.encode(IpcWalletState(initialized = false)))!!
         assertEquals(false, decoded.initialized)
+        assertEquals(0L, decoded.total)
         assertEquals(0L, decoded.custody)
         assertEquals(0L, decoded.margin)
         assertEquals(0L, decoded.highWaterSeq)
         assertEquals("", decoded.tipHash)
         assertEquals(false, decoded.terminal)
+        assertEquals(false, decoded.grantClaimedToday)
     }
 
     @Test

@@ -15,6 +15,8 @@ import org.junit.Test
  *        篡改-删除-回滚-重放四类攻击检出 / 域分离
  * v3.38: 双账户 (custody/margin) / DEPOSIT-WITHDRAW / 足额规则 /
  *        HANDOVER 终结语义 / 交接证书验证 / v3.37 链兼容
+ * v3.39: 单账户合并 —— balance/canSpend 一律取 total, 足额改总额,
+ *        HANDOVER 全额移交 total (旧链 custody 语义兼容)
  */
 class WalletLedgerTest {
 
@@ -116,6 +118,8 @@ class WalletLedgerTest {
         // margin: 4500 + 1000 - 30 + 10; custody: 0 (v3.37 链无托管流水)
         assertEquals(5480L, ok.balances.margin)
         assertEquals(0L, ok.balances.custody)
+        // v3.39: 可用余额 = total (custody + margin)
+        assertEquals(5480L, ok.balances.total)
         assertEquals(5480L, ledger.balance())
         assertEquals(WalletBalances(custody = 0, margin = 5480), ledger.balances())
         assertEquals(5L, ledger.nextSeq())
@@ -131,10 +135,10 @@ class WalletLedgerTest {
         assertEquals("", ledger.nextPrevHash())
     }
 
-    // ---- v3.38 双账户: DEPOSIT / WITHDRAW ----
+    // ---- v3.38 划转交易 (v3.39: 仅旧链推导, total 效果恒为 0) ----
 
     @Test
-    fun `deposit moves custody to margin`() {
+    fun `transfer txs keep total invariant and spend checks total`() {
         // 提回 1000 (margin→custody) → 充值 400 (custody→margin) → 打赏 50
         val ledger = WalletLedger(pub)
         val g = signedTx(1, TxType.GENESIS, 4500)
@@ -144,15 +148,15 @@ class WalletLedgerTest {
         val ok = ok(ledger.load(listOf(g, wd, dep, tip)))
         // custody: 1000 - 400 = 600; margin: 4500 - 1000 + 400 - 50 = 3850
         assertEquals(WalletBalances(custody = 600, margin = 3850), ok.balances)
-        assertTrue(ledger.canSpend(3850))
-        assertTrue(!ledger.canSpend(3851))
-        assertTrue(ledger.canDeposit(600))
-        assertTrue(!ledger.canDeposit(601))
+        // v3.39: 划转不改 total (4500-50=4450), 足额一律按 total
+        assertEquals(4450L, ok.balances.total)
+        assertTrue(ledger.canSpend(4450))
+        assertTrue(!ledger.canSpend(4451))
     }
 
     @Test
     fun `overspend rejected by running-balance rule`() {
-        // 权威记账方从不签超支交易: 链上出现负 margin = 妥协信号 → TAMPERED
+        // 权威记账方从不签超支交易: 链上出现负 total = 妥协信号 → TAMPERED
         val g = signedTx(1, TxType.GENESIS, 100)
         val overspend = signedTx(2, TxType.SPEND, 200, prevHash = g.txHash)
         val check = WalletLedger(pub).verify(listOf(g, overspend))
@@ -160,14 +164,18 @@ class WalletLedgerTest {
     }
 
     @Test
-    fun `over-deposit rejected by custody rule`() {
-        val g = signedTx(1, TxType.GENESIS, 100)
-        val wd = signedTx(2, TxType.WITHDRAW, 50, prevHash = g.txHash)
-        val overDep = signedTx(3, TxType.DEPOSIT, 80, prevHash = wd.txHash) // custody 只有 50
-        bad(WalletLedger(pub).verify(listOf(g, wd, overDep)))
+    fun `spend may draw on custody after merge - single balance semantics`() {
+        // v3.39 核心: custody 200 + margin 300, SPEND 400 —— 旧双账户
+        // 规则 (margin < 400) 与新总额规则 (total 500 ≥ 400) 判定相反,
+        // 合并语义下这笔交易合法 —— 托管与可用本就是同一个余额。
+        val g = signedTx(1, TxType.GENESIS, 500)
+        val wd = signedTx(2, TxType.WITHDRAW, 200, prevHash = g.txHash) // custody 200, margin 300
+        val spend = signedTx(3, TxType.SPEND, 400, prevHash = wd.txHash) // total 100 ≥ 0
+        val ok = ok(WalletLedger(pub).verify(listOf(g, wd, spend)))
+        assertEquals(100L, ok.balances.total)
     }
 
-    // ---- v3.38 HANDOVER 终结语义 ----
+    // ---- v3.38/v3.39 HANDOVER 终结语义 ----
 
     private fun handoverChain(newPubHex: String): List<WalletTx> {
         val g = signedTx(1, TxType.GENESIS, 4500)
@@ -177,17 +185,34 @@ class WalletLedgerTest {
     }
 
     @Test
-    fun `handover terminal chain verifies with drained custody`() {
+    fun `legacy handover draining only custody still verifies`() {
+        // v3.38 旧链兼容: amount == custody (margin 不迁移) 依然合法
         val newKp = ecdsa.generateKeyPair()
         val newPubHex = HandoverCertificate.pubKeyHex(ecdsa.encodePublicKey(newKp.public))
         val ledger = WalletLedger(pub)
         val ok = ok(ledger.load(handoverChain(newPubHex)))
-        // custody 全额移交 → 0; margin 2500 不迁移 (可弃)
+        // custody 全额移交 → 0; margin 2500 残留 (旧语义可弃) → total 2500
         assertEquals(WalletBalances(custody = 0, margin = 2500), ok.balances)
+        assertEquals(2500L, ok.balances.total)
         assertTrue(ledger.isTerminal())
         // 终结链不可再追加
         val extra = signedTx(4, TxType.GRANT, 100, prevHash = ledger.nextPrevHash())
         bad(ledger.appendTx(extra))
+    }
+
+    @Test
+    fun `v3_39 handover drains total balance`() {
+        // v3.39: amount == total (custody 2000 + margin 2500 = 4500) 全额移交;
+        // effects 后 custody = -2500 (分量透支) 但 total = 0 —— 总额规则下合法
+        val newKp = ecdsa.generateKeyPair()
+        val newPubHex = HandoverCertificate.pubKeyHex(ecdsa.encodePublicKey(newKp.public))
+        val g = signedTx(1, TxType.GENESIS, 4500)
+        val wd = signedTx(2, TxType.WITHDRAW, 2000, prevHash = g.txHash)
+        val ho = signedTx(3, TxType.HANDOVER, 4500, counterparty = newPubHex, memo = "handover:4500", prevHash = wd.txHash)
+        val ledger = WalletLedger(pub)
+        val ok = ok(ledger.load(listOf(g, wd, ho)))
+        assertEquals(0L, ok.balances.total)
+        assertTrue(ledger.isTerminal())
     }
 
     @Test
@@ -200,12 +225,12 @@ class WalletLedgerTest {
     }
 
     @Test
-    fun `handover must drain custody fully`() {
+    fun `handover must drain balance fully`() {
         val newKp = ecdsa.generateKeyPair()
         val newPubHex = HandoverCertificate.pubKeyHex(ecdsa.encodePublicKey(newKp.public))
         val g = signedTx(1, TxType.GENESIS, 4500)
         val wd = signedTx(2, TxType.WITHDRAW, 2000, prevHash = g.txHash)
-        // custody=2000, 只交 1500 → 残留 500 死账 → 违规
+        // custody=2000, margin=2500, total=4500; 只交 1500 → 残留死账 → 违规
         val partial = signedTx(3, TxType.HANDOVER, 1500, counterparty = newPubHex, prevHash = wd.txHash)
         bad(WalletLedger(pub).verify(listOf(g, wd, partial)))
     }
@@ -225,14 +250,13 @@ class WalletLedgerTest {
         val newPubX509 = ecdsa.encodePublicKey(newKp.public)
         val newPubHex = HandoverCertificate.pubKeyHex(newPubX509)
         val oldPubX509 = ecdsa.encodePublicKey(pub)
-        // 旧链: custody 2000 (与 handoverChain 同构)
-        val g = signedTx(1, TxType.GENESIS, 4500)
-        val wd = signedTx(2, TxType.WITHDRAW, 2000, prevHash = g.txHash)
+        // 旧链: total 2000 (v3.39 全额移交语义)
+        val g = signedTx(1, TxType.GENESIS, 2000)
         val unsignedHo = HandoverCertificate.buildHandoverTx(
-            custodySnapshot = 2000,
+            balanceSnapshot = 2000,
             newPubKeyHex = newPubHex,
-            seq = 3,
-            prevHash = wd.txHash,
+            seq = 2,
+            prevHash = g.txHash,
         )
         val sig = ecdsa.sign(priv, TxCanonical.bytes(unsignedHo))
         val hoTx = unsignedHo.copy(signature = Base64.getEncoder().encodeToString(sig))
@@ -249,11 +273,11 @@ class WalletLedgerTest {
         val (cert, newPubX509) = buildCertificate()
         val result = cert.verify(newPubX509)
         val ok = expectAny<HandoverCertificate.VerifyResult.Ok>(result)
-        assertEquals(2000L, ok.custodyCarried)
+        assertEquals(2000L, ok.balanceCarried)
 
         // 新链 GENESIS 承接 (新密钥签名 — 由新机 WalletKeyManager 完成, 此处验证结构)
         val genesis = HandoverCertificate.buildGenesisTx(
-            custodyCarried = ok.custodyCarried,
+            balanceCarried = ok.balanceCarried,
             oldPubKeyHex = cert.oldPubKeyHex()!!,
             handoverTxHash = ok.handoverTxHash,
         )
@@ -268,12 +292,11 @@ class WalletLedgerTest {
         val signed = genesis.copy(signature = Base64.getEncoder().encodeToString(sig2))
         val newLedger = WalletLedger(newKp2.public)
         val newCheck = ok(newLedger.load(listOf(signed)))
-        // GENESIS 双语义 (v3.38 定稿): 承接链的 custody 全额落地托管,
-        // margin 为 0 —— 储蓄迁移后仍是储蓄, 消费需先充值 (DEPOSIT)
+        // v3.39 合并语义: 承接余额直达可用 (total), 无需充值环节
         assertEquals(WalletBalances(custody = 2000, margin = 0), newCheck.balances)
-        assertEquals(WalletBalances(custody = 2000, margin = 0), newLedger.balances())
-        assertTrue(newLedger.canDeposit(2000))
-        assertTrue(!newLedger.canSpend(1)) // margin 0: 承接未充值不可消费
+        assertEquals(2000L, newLedger.balance())
+        assertTrue(newLedger.canSpend(2000))
+        assertTrue(!newLedger.canSpend(2001))
     }
 
     @Test

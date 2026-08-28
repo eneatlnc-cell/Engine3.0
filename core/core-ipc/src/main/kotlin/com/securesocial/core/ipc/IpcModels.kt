@@ -19,6 +19,11 @@ enum class IpcErrorCode(val code: String, val description: String) {
     NO_WALLET_KEY("NO_WALLET_KEY", "Vault 中没有该应用的钱包密钥, 请先初始化钱包"),
     TX_FORMAT_ERROR("TX_FORMAT_ERROR", "交易载荷格式错误, 无法解析"),
     TX_SEQ_REJECTED("TX_SEQ_REJECTED", "交易序号未超过高水位 (检测到账本回滚), 拒绝签名"),
+    // ---- v3.39: 赠金幂等 + 单账户合并 ----
+    /** GRANT 每日幂等: 权威账本当日已有 GRANT (memo: daily-grant:<date>), 拒绝再签 */
+    GRANT_ALREADY_CLAIMED("GRANT_ALREADY_CLAIMED", "今日赠金已领取 (以 Vault 账本为准)"),
+    /** SPEND 总额足额失败 (v3.39: custody+margin < amount) */
+    INSUFFICIENT_TOTAL("INSUFFICIENT_TOTAL", "可用余额不足"),
     // ---- v3.38: 双账户足额 + 交接终结错误码 ----
     /** SPEND/WITHDRAW 足额失败: 权威账本 margin < amount (可用余额不足, 引导充值) */
     INSUFFICIENT_MARGIN("INSUFFICIENT_MARGIN", "可用余额不足, 请先从托管余额充值"),
@@ -318,9 +323,14 @@ data class IpcSignTxRequest(
  *
  * 从 myvault://walletstate URI 解析而来 (纯路由, 无载荷 Extra)。
  * Vault 免指纹应答 —— 摘要非秘密材料, 入口受 signature 权限保护。
+ *
+ * v3.39: [full] = true (URI full=1) 时应答携带完整已签名链 (chainJson)
+ * 与 grantClaimedToday —— Engine 重装/分叉场景一次拉全量重建镜像。
  */
 data class IpcWalletStateRequest(
-    val sessionId: String
+    val sessionId: String,
+    /** v3.39: 请求全链拉取 (URI 参数 full=1) */
+    val full: Boolean = false,
 ) {
     companion object {
         /** 从 Intent 解析状态查询请求 */
@@ -332,8 +342,20 @@ data class IpcWalletStateRequest(
         /** 从 URI 解析状态查询请求 */
         fun fromUri(uri: Uri): IpcWalletStateRequest? {
             if (!IpcContract.isWalletStateUri(uri)) return null
-            val sessionId = uri.getQueryParameter(IpcContract.PARAM_SESSION) ?: return null
-            return IpcWalletStateRequest(sessionId)
+            return fromParams(
+                uri.getQueryParameter(IpcContract.PARAM_SESSION),
+                uri.getQueryParameter(IpcContract.PARAM_FULL),
+            )
+        }
+
+        /**
+         * 从查询参数表解析 (纯 Kotlin, 本地单测锚点):
+         * full 语义 = 参数值恰为 "1" —— 其余值 (缺省/0/true/任意串)
+         * 一律视为非全量请求。
+         */
+        fun fromParams(sessionId: String?, full: String?): IpcWalletStateRequest? {
+            if (sessionId == null) return null
+            return IpcWalletStateRequest(sessionId, full == "1")
         }
     }
 }
@@ -350,14 +372,25 @@ data class IpcWalletStateRequest(
  * - highWaterSeq > 本地镜像尾序号 → 镜像丢账, 拉全量重建;
  * - highWaterSeq < 本地镜像尾序号 → 账本回滚 (严重异常, 锁定钱包);
  * - terminal → 锁定钱包 UI, 引导 "已迁出" 文案。
+ *
+ * v3.39 字段演进:
+ * - [total] 可用余额 (custody + margin 合并语义, Engine 展示/足额一律
+ *   以此为准); custody/margin 分量保留仅为诊断旧链划转流水;
+ * - [grantClaimedToday] 权威账本当日是否已有 GRANT (每日赠金幂等标记,
+ *   Vault 按自身账本扫描 daily-grant:<date> 判定 —— 卸载重装 Engine
+ *   不再重复赠送);
+ * - [chainJson] full=1 请求时携带完整已签名链 (List<WalletTx> JSON),
+ *   Engine 空镜像/分叉时全量重建, 追加前仍走全链校验。
  */
 @kotlinx.serialization.Serializable
 data class IpcWalletState(
     /** 钱包密钥是否已初始化 (false 时其余字段无意义) */
     val initialized: Boolean,
-    /** 权威托管余额 (换机可迁移) */
+    /** 可用余额 (v3.39 合并语义 = custody + margin; Engine 唯一展示口径) */
+    val total: Long = 0L,
+    /** 权威托管余额 (v3.38 历史分量, 诊断用) */
     val custody: Long = 0L,
-    /** 权威可用余额 (Engine 侧计费资金池) */
+    /** 权威可用余额分量 (v3.38 历史分量, 诊断用) */
     val margin: Long = 0L,
     /** 已签名交易的最高序号 (高水位) */
     val highWaterSeq: Long = 0L,
@@ -367,6 +400,8 @@ data class IpcWalletState(
     val terminal: Boolean = false,
     /** 交易总数 (含 GENESIS; Engine 侧全量重建的行数校验; -1 = 权威账本 TAMPERED) */
     val txCount: Long = 0L,
+    /** 每日赠金幂等标记: 权威账本当日已有 GRANT (Vault 账本为准) */
+    val grantClaimedToday: Boolean = false,
     /**
      * 权威账本尾交易 JSON (WalletTx 编码; 空账本为 null)。
      *
@@ -377,6 +412,16 @@ data class IpcWalletState(
      * (appendTx), 双重防线: 回调签名 (v3.29) + 链上签名验证。
      */
     val tipTxJson: String? = null,
+    /**
+     * 完整已签名链 JSON (List<WalletTx> 编码; 仅 full=1 请求携带)。
+     *
+     * 全量重建通道 (v3.39): Engine 重装/清数据后镜像为空, 或镜像与
+     * 权威链分叉 (tipHash 不一致) 时, 一次对账拉全链重建镜像 ——
+     * 从根上终结 "seq 拒绝 → 重试 → Vault 弹框" 的死循环。重建
+     * 前仍走 WalletLedger.verify 全链校验 (签名/链接/足额), 链不可
+     * 验证则拒绝落库并提示。
+     */
+    val chainJson: String? = null,
 ) {
     companion object {
         private val json = kotlinx.serialization.json.Json {

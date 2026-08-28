@@ -33,8 +33,9 @@ import java.util.Base64
  *  · 新公钥 — 与交易 counterparty 比对, 防中间人调包;
  *  · 交接交易 — 旧密钥对规范化字节的签名 (域分离)。
  *
- *  新链承接语义: 新链 GENESIS 的 amount = 交接交易的 custody 快照;
- *  margin 不迁移 (可弃设计 —— 丢了就再充, 见 WalletTx 头注)。
+ *  新链承接语义: 新链 GENESIS 的 amount = 交接交易的余额快照
+ *  (v3.39: total 全额移交; v3.38 旧证书为 custody 快照, 结构不变,
+ *  新机按 amount 原样承接, 天然兼容)。
  *
  *  诚实边界 (自托管无救济, 产品层必须明示):
  *  · 交接为**单方终结**: 旧链在交接后不可续签 (Vault 清除密钥),
@@ -80,22 +81,22 @@ data class HandoverCertificate(
         /**
          * 构造未签名交接交易 (旧机, 指纹验证通过后调用)。
          *
-         * @param custodySnapshot 交接时点的 custody 余额 (全额移交)
+         * @param balanceSnapshot 交接时点余额 (v3.39: total 全额移交)
          * @param newPubKeyHex    新公钥 hex (= counterparty)
          * @param seq             旧链下一序号
          * @param prevHash        旧链当前尾哈希
          */
         fun buildHandoverTx(
-            custodySnapshot: Long,
+            balanceSnapshot: Long,
             newPubKeyHex: String,
             seq: Long,
             prevHash: String,
         ): WalletTx = WalletTx(
             seq = seq,
             type = TxType.HANDOVER,
-            amount = custodySnapshot,
+            amount = balanceSnapshot,
             counterparty = newPubKeyHex,
-            memo = "handover:$custodySnapshot",
+            memo = "handover:$balanceSnapshot",
             timestamp = System.currentTimeMillis(),
             prevTxHash = prevHash,
             signature = "",
@@ -108,13 +109,13 @@ data class HandoverCertificate(
          * (审计回溯锚点: 任何人可用旧公钥复验该哈希对应的签名)。
          */
         fun buildGenesisTx(
-            custodyCarried: Long,
+            balanceCarried: Long,
             oldPubKeyHex: String,
             handoverTxHash: String,
         ): WalletTx = WalletTx(
             seq = 1L,
             type = TxType.GENESIS,
-            amount = custodyCarried,
+            amount = balanceCarried,
             counterparty = oldPubKeyHex,
             memo = "handover-genesis:$handoverTxHash",
             timestamp = System.currentTimeMillis(),
@@ -125,8 +126,8 @@ data class HandoverCertificate(
 
     /** 验证结果 */
     sealed class VerifyResult {
-        /** 验证通过: [custodyCarried] = 可承接的 custody 快照 */
-        data class Ok(val custodyCarried: Long, val handoverTxHash: String) : VerifyResult()
+        /** 验证通过: [balanceCarried] = 可承接的余额快照 (v3.39: total) */
+        data class Ok(val balanceCarried: Long, val handoverTxHash: String) : VerifyResult()
 
         /** 验证失败: [reason] 面向用户 (不含敏感材料) */
         data class Bad(val reason: String) : VerifyResult()
@@ -178,7 +179,7 @@ data class HandoverCertificate(
 
         if (oldHex.isEmpty()) return VerifyResult.Bad("旧公钥为空")
         return VerifyResult.Ok(
-            custodyCarried = handoverTx.amount,
+            balanceCarried = handoverTx.amount,
             handoverTxHash = handoverTx.txHash,
         )
     }
