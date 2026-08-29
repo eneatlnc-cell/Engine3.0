@@ -75,6 +75,10 @@ License: **AGPL-3.0** · 快照版本: **v3.45.0-audit**
   全灭后，中继是唯一卸载杀不死的外部记忆点。客户端侧另有金额
   白名单（`WalletGrant.DAILY_GRANT_AMOUNT`）与"memo 必须 == 签名端
   当日"门槛（时钟偏移封堵）作纵深防线
+- **部署边界（v3.45.4 入档）**：中继去重表为进程内存态，防滥用
+  效果以**单实例部署**为前提——多实例须先实施 `h` 分片路由
+  （设计定稿见 [ARCHITECTURE.md](ARCHITECTURE.md) 部署拓扑边界），
+  否则去重效果随实例数稀释；容量不足先垂直扩容
 
 架构与信任域划分详见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
