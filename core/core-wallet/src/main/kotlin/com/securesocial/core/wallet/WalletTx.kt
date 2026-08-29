@@ -112,6 +112,15 @@ object WalletGrant {
     /** 每日赠金 memo 前缀; 完整格式 "daily-grant:<yyyy-MM-dd>" */
     const val MEMO_PREFIX = "daily-grant:"
 
+    /**
+     * 每日赠金标准额度 (v3.43: Vault 签名侧金额白名单判据)。
+     *
+     * 与 Engine 侧 SparkEconomy.DAILY_LOGIN_GRANT 同值 —— GRANT 交易
+     * 金额由 Engine 填写, 签名前 Vault 强制等于本值: 被篡改/伪造的
+     * Engine (或未来回归) 无法以任意金额铸造赠金。
+     */
+    const val DAILY_GRANT_AMOUNT = 1000L
+
     /** 生成指定时刻所在日的赠金 memo (yyyy-MM-dd, 设备本地时区) */
     fun memoForDate(epochMillis: Long = System.currentTimeMillis()): String {
         val fmt = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)

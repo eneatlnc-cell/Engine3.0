@@ -25,7 +25,9 @@ enum class MessageType {
     GROUP_MSG,     // v3.14: 群聊消息 (群密钥加密); v3.18: target=null 时走中继扇出路径
     GROUP_CTRL,    // v3.14: 群控制信令 (成对加密: 密钥分发/花名册/入群/退群/解散)
     GROUP_SUBSCRIBE, // v3.18: 客户端 → 中继: 订阅群扇出 (groupId 即鉴权, 中继零验证)
-    GROUP_FANOUT   // v3.18: 群密钥控制帧扇出 (PRESENCE 等, 中继向订阅集投递, 同 GROUP_MSG 密文透传)
+    GROUP_FANOUT,   // v3.18: 群密钥控制帧扇出 (PRESENCE 等, 中继向订阅集投递, 同 GROUP_MSG 密文透传)
+    GRANT_CHECK,    // v3.45: 领金日去重 (客户端 → 中继: 设备哈希+当日, 中继当日集合幂等)
+    GRANT_ACK       // v3.45: 中继对 GRANT_CHECK 的应答 (allowed=false = 当日已领)
 }
 
 /**
@@ -397,3 +399,29 @@ object ProtocolConstants {
     const val GLOBAL_FANOUT_BYTES_PER_SECOND = 8L * 1024 * 1024
     const val GLOBAL_FANOUT_BYTES_BURST = 32L * 1024 * 1024
 }
+
+/**
+ * GRANT_CHECK 载荷 (v3.45) - 领金日去重
+ *
+ * h 为设备哈希: SHA-256("spark-grant-dedupe/1" ‖ day ‖ deviceSeed) 前 16 hex。
+ * deviceSeed 客户端本地派生 (TEE/DRM 种子优先, 跨卸载稳定) —— 中继只见
+ * 不可链接哈希, 不同日互不可关联, 中继无法跨日追踪同一设备。
+ * day 由客户端本地日历产生; 时钟偏移攻击由 Vault 签名侧
+ * "memo 必须 == Vault 本地今日" 门槛封死, 中继不做时钟裁决。
+ */
+@Serializable
+data class GrantCheckPayload(
+    val h: String,     // 设备日哈希 (16 hex)
+    val day: String    // 客户端本地领金日 (yyyy-MM-dd)
+)
+
+/**
+ * GRANT_ACK 载荷 (v3.45) - 中继应答
+ *
+ * allowed=false = 该 (day, h) 已被领取过 (当日重复/重装重领)。
+ */
+@Serializable
+data class GrantAckPayload(
+    val allowed: Boolean,
+    val day: String
+)

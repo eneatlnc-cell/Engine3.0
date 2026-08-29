@@ -459,5 +459,24 @@ class WalletLedgerTest {
         assertTrue(!ledger.isTerminal())
     }
 
+    // ---- v3.45: 赠金跨端契约冻结 ----
+
+    @Test
+    fun `wallet grant constants stay consistent`() {
+        // 签名端金额白名单与 memo 前缀是跨端契约, 冻结防漂移:
+        // MEMO_PREFIX / DAILY_GRANT_AMOUNT 与 Engine 侧 SparkEconomy 同值,
+        // Vault 签名前强制 GRANT 金额 == DAILY_GRANT_AMOUNT (见 WalletGrant 头注)
+        assertEquals("daily-grant:", WalletGrant.MEMO_PREFIX)
+        assertEquals(1000L, WalletGrant.DAILY_GRANT_AMOUNT)
+        assertTrue(WalletGrant.memoForDate(0L).startsWith("daily-grant:"))
+        // 标准链中的赠金 memo 即按此契约构造
+        assertEquals(
+            "daily-grant:2026-08-27",
+            WalletGrant.memoForDate(java.text.SimpleDateFormat(
+                "yyyy-MM-dd", java.util.Locale.US
+            ).parse("2026-08-27").time)
+        )
+    }
+
     private fun ledgerHash(chain: List<WalletTx>): String = chain.last().txHash
 }

@@ -200,6 +200,41 @@ object ProtocolSerializer {
         json.decodeFromString(RoomInfoPayload.serializer(), payload)
     } catch (e: Exception) { null }
 
+    // ==================== v3.45: 领金日去重 ====================
+
+    /**
+     * GRANT_CHECK - 领金前置核验 (客户端 → 中继)
+     *
+     * h = SHA-256("spark-grant-dedupe/1" ‖ day ‖ deviceSeed) 前 16 hex。
+     * deviceSeed 为设备本地派生 (TEE/DRM 种子, 跨卸载稳定) —— 中继只见
+     * 不可链接哈希: 不同日的 h 互不可关联, 中继无法跨日追踪同一设备。
+     */
+    fun encodeGrantCheck(fingerprint: String, h: String, day: String, seq: Long): String {
+        return encode(MessageEnvelope(
+            type = MessageType.GRANT_CHECK,
+            source = fingerprint,
+            payload = json.encodeToString(GrantCheckPayload(h, day)),
+            seq = seq
+        ))
+    }
+
+    /** GRANT_ACK - 中继应答 (allowed=false = 该 (day,h) 当日已领取) */
+    fun encodeGrantAck(target: String, allowed: Boolean, day: String): String {
+        return encode(MessageEnvelope(
+            type = MessageType.GRANT_ACK,
+            target = target,
+            payload = json.encodeToString(GrantAckPayload(allowed, day))
+        ))
+    }
+
+    fun decodeGrantCheckPayload(payload: String): GrantCheckPayload? = try {
+        json.decodeFromString(GrantCheckPayload.serializer(), payload)
+    } catch (e: Exception) { null }
+
+    fun decodeGrantAckPayload(payload: String): GrantAckPayload? = try {
+        json.decodeFromString(GrantAckPayload.serializer(), payload)
+    } catch (e: Exception) { null }
+
     // ==================== v3.14: 群组消息与控制 ====================
 
     /**

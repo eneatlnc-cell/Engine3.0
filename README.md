@@ -4,14 +4,14 @@
 > 闭源，端到端加密层在此开源，接受社区审计——加密闭源没有意义，
 > **可验证性才是安全的来源**（Signal 模式）。
 
-License: **AGPL-3.0** · 快照版本: **v3.40.1-audit**
+License: **AGPL-3.0** · 快照版本: **v3.45.0-audit**
 
 ## 本仓库包含什么
 
 | 模块 | 内容 | 测试 |
 |---|---|---|
 | `core/core-crypto` | AES-256-GCM 封装、P-256 ECDSA 签名/验签、ECDH 密钥协商、SHA-256 密钥指纹、中继挑战-应答（SignalAuth）、密钥导入导出序列化、本地备份容器格式（PBKDF2 + AES-GCM） | 5 套 |
-| `core/core-protocol` | 消息信封线协议（AAD 绑定双方指纹+序列号防重放）、协议序列化、Spark 账本协议（SPARK-V1 HTTP 签名内容、计量常量、错误码与请求模型） | 1 套 |
+| `core/core-protocol` | 消息信封线协议（AAD 绑定双方指纹+序列号防重放）、协议序列化、Spark 账本协议（SPARK-V1 HTTP 签名内容、计量常量、错误码与请求模型）、领金日去重帧（v3.45：`GRANT_CHECK`/`GRANT_ACK`，不可链接设备日哈希） | 1 套 |
 | `core/core-ipc` | Engine↔Vault 签名回调契约（回调签名规则、错误码、防篡改；钱包密钥初始化/交易签名/总额足额校验/账本对账摘要/全链拉取（full=1）/每日赠金幂等标记/交接承接请求契约）、v3.40 Binder 直连通道契约（事务描述符逐字节一致、signature 权限保护绑定、回调注册表、旧 Activity 跳转通道回退） | 1 套 |
 | `core/core-wallet` | 本地签名账本：交易模型与规范化序列化、域分离签名（SPARK-WALLET-TX-V1）、append-only 哈希链、单一可用余额推导（total，v3.39 合并双账户；旧链 custody/margin 分量仍可推导）、全链验签（重放/回退/断链检出）、钱包交接协议（HANDOVER 终结交易 + 交接证书 + 承接 GENESIS） | 1 套 |
 
@@ -66,6 +66,15 @@ License: **AGPL-3.0** · 快照版本: **v3.40.1-audit**
   Engine 进程。密码学契约原样复用（回调验签、result 纳入签名范围），
   只换投递方式不弱化安全；旧 Activity 跳转通道保留为自动回退，
   双端可独立升级
+- **领金日去重（v3.45）**：每日赠金的防滥用不依赖任何账号体系——
+  客户端在领取前经已认证连接发送 `GRANT_CHECK(h, day)`，其中
+  `h = SHA-256("spark-grant-dedupe/1" ‖ day ‖ deviceSeed)` 为**不可
+  链接**设备日哈希（不同日互不可关联，中继无法跨日追踪设备），
+  中继当日集合原子查并占后回 `GRANT_ACK(allowed)`。设备种子优先
+  取 TEE/DRM 派生值（同包名重装不变），注册卸载清空等本地记忆
+  全灭后，中继是唯一卸载杀不死的外部记忆点。客户端侧另有金额
+  白名单（`WalletGrant.DAILY_GRANT_AMOUNT`）与"memo 必须 == 签名端
+  当日"门槛（时钟偏移封堵）作纵深防线
 
 架构与信任域划分详见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
