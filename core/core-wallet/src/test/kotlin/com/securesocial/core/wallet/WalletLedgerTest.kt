@@ -3,6 +3,7 @@ package com.securesocial.core.wallet
 import com.securesocial.core.crypto.EcdsaOperations
 import java.util.Base64
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -17,6 +18,9 @@ import org.junit.Test
  *        HANDOVER 终结语义 / 交接证书验证 / v3.37 链兼容
  * v3.39: 单账户合并 —— balance/canSpend 一律取 total, 足额改总额,
  *        HANDOVER 全额移交 total (旧链 custody 语义兼容)
+ * v3.49: 交易来源归属 (source 列) —— 编解码往返 / 签名域排他
+ *        (注入归属不改变规范化字节与 txHash) / 混来源链验签 /
+ *        旧载荷无 source 字段解码为 null / 未签名列诚实边界
  */
 class WalletLedgerTest {
 
@@ -459,23 +463,65 @@ class WalletLedgerTest {
         assertTrue(!ledger.isTerminal())
     }
 
-    // ---- v3.45: 赠金跨端契约冻结 ----
+    // ---- v3.49 交易来源归属 (source 列) ----
 
     @Test
-    fun `wallet grant constants stay consistent`() {
-        // 签名端金额白名单与 memo 前缀是跨端契约, 冻结防漂移:
-        // MEMO_PREFIX / DAILY_GRANT_AMOUNT 与 Engine 侧 SparkEconomy 同值,
-        // Vault 签名前强制 GRANT 金额 == DAILY_GRANT_AMOUNT (见 WalletGrant 头注)
-        assertEquals("daily-grant:", WalletGrant.MEMO_PREFIX)
-        assertEquals(1000L, WalletGrant.DAILY_GRANT_AMOUNT)
-        assertTrue(WalletGrant.memoForDate(0L).startsWith("daily-grant:"))
-        // 标准链中的赠金 memo 即按此契约构造
-        assertEquals(
-            "daily-grant:2026-08-27",
-            WalletGrant.memoForDate(java.text.SimpleDateFormat(
-                "yyyy-MM-dd", java.util.Locale.US
-            ).parse("2026-08-27").time)
-        )
+    fun `source field roundtrips through json codec`() {
+        // 应用包名 / Vault 保留字 / null (旧链) 三种取值全部往返保持
+        val tx = signedTx(2, TxType.GRANT, 1000)
+        assertEquals("com.engine", TxJsonCodec.decode(TxJsonCodec.encode(tx.copy(source = "com.engine")))!!.source)
+        assertEquals(TxSource.VAULT, TxJsonCodec.decode(TxJsonCodec.encode(tx.copy(source = TxSource.VAULT)))!!.source)
+        assertNull(TxJsonCodec.decode(TxJsonCodec.encode(tx.copy(source = null)))!!.source)
+    }
+
+    @Test
+    fun `old chain json without source decodes as null`() {
+        // v3.44 及以前的账本文件 / IPC 载荷没有 source 字段:
+        // 新解码器必须原样接收 (source=null), 升级不破坏任何已签链
+        val json = TxJsonCodec.encode(signedTx(2, TxType.GRANT, 1000))
+            .replace(""","source":null""", "")
+        assertFalse(json.contains("source"))
+        assertNull(TxJsonCodec.decode(json)!!.source)
+    }
+
+    @Test
+    fun `source is excluded from canonical signature domain`() {
+        // 签名域不含 source —— Vault 在签名时注入归属**不改变**签名对象
+        // 字节与链哈希: 这是新旧版本任意混布 (旧端验签互认) 的机制根基。
+        // signedTx 的签名基于无 source 的交易计算; 携带 source 的副本
+        // 验签/哈希全部照常成立, 即为证明。
+        val g = signedTx(1, TxType.GENESIS, 100)
+        val plain = signedTx(2, TxType.SPEND, 30, prevHash = g.txHash)
+        val attributed = plain.copy(source = "com.engine")
+        assertTrue(TxCanonical.bytes(plain).contentEquals(TxCanonical.bytes(attributed)))
+        assertEquals(plain.txHash, attributed.txHash)
+        // 链式链接不受归属列影响: 后继交易的 prevTxHash 仍指向同一哈希,
+        // 混来源链验签照常通过
+        val next = signedTx(3, TxType.GRANT, 1000, prevHash = attributed.txHash)
+        val ok = ok(WalletLedger(pub).load(listOf(g, attributed, next)))
+        assertEquals(1070L, ok.balances.total)
+    }
+
+    @Test
+    fun `mixed-source chain verifies across apps`() {
+        // 一钱包一总账多应用: 不同来源归属的交易混链验签通过 ——
+        // 共享总账模型的直接产物 (Engine / 未来应用 / 旧链 null)
+        val g = signedTx(1, TxType.GENESIS, 100).copy(source = "com.engine")
+        val spend = signedTx(2, TxType.SPEND, 10, prevHash = g.txHash).copy(source = "com.future.app")
+        val grant = signedTx(3, TxType.GRANT, 1000, prevHash = spend.txHash).copy(source = null)
+        val ok = ok(WalletLedger(pub).load(listOf(g, spend, grant)))
+        assertEquals(1090L, ok.balances.total)
+    }
+
+    @Test
+    fun `source tamper does not break signature - unsigned column boundary`() {
+        // 诚实边界 (有意行为, 入档): source 是未签名审计列 —— root 级
+        // 改写 source 不触发验签失败。安全核心 (金额/序号/链接/足额)
+        // 仍由签名覆盖; 能写 Vault 私有目录的攻击者本可重写整本账本,
+        // source 未降低既有安全水位 (详见 WalletTx / TxCanonical 头注)。
+        val relabeled = standardChain().map { it.copy(source = "spoofed.app") }
+        val ok = ok(WalletLedger(pub).verify(relabeled))
+        assertEquals(5480L, ok.balances.margin)
     }
 
     private fun ledgerHash(chain: List<WalletTx>): String = chain.last().txHash

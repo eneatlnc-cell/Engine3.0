@@ -76,7 +76,16 @@ object SparkEconomy {
     fun costFor(bytes: Long): Long {
         require(bytes >= 0) { "bytes must be >= 0" }
         if (bytes == 0L) return MIN_COST_PER_MESSAGE
-        return maxOf(MIN_COST_PER_MESSAGE, (bytes + 1023) / 1024 * SPARK_PER_KB)
+        // 防御性修复 (E-10): 原 `(bytes + 1023)` 在 bytes 接近 Long.MAX_VALUE
+        // 时上溢为负, 导致除/乘结果异常甚至负单价。改用「除后补余」避免
+        // 加法溢出, 并对 1KB = 10 Spark 的乘法做 Long 上溢钳制。
+        val kb = bytes / 1024L + if (bytes % 1024L == 0L) 0L else 1L
+        val cost = if (kb > Long.MAX_VALUE / SPARK_PER_KB) {
+            Long.MAX_VALUE
+        } else {
+            kb * SPARK_PER_KB
+        }
+        return maxOf(MIN_COST_PER_MESSAGE, cost)
     }
 
     /**
@@ -115,6 +124,26 @@ object SparkEconomy {
 
     /** 批量结算定时 (兜底) */
     const val SETTLE_INTERVAL_MS = 30_000L
+
+    /**
+     * 涂鸦留言卡单价 (v3.56; v3.63 由 1000 调整为 100000): 100000 Spark/张。
+     *
+     * 公开推广面的经济学门槛 —— 客户端钱包侧执行 (计量消耗,
+     * 确认后扣费: 中继回显 GRAFFITI_CARD 才落账); 中继不核账本,
+     * 只叠加节奏护栏 (GRAFFITI_POST_COOLDOWN_MS), 与消息计费
+     * 同为「客户端经济学 + 服务端防滥用」分工。
+     */
+    const val GRAFFITI_CARD_COST = 100_000L
+
+    /**
+     * v3.81: 涂鸦卡片留言单价 (10 SPARK/条)。
+     *
+     * 与发帖同为「客户端经济学 + 确认后扣费」: 收到本人留言的
+     * 更新卡回显才落账; 被拒 (COMMENT_EXISTS/TOO_LONG/COOLDOWN/
+     * CARD_NOT_FOUND) 或超时无回显一律不计费。低门槛保互动,
+     * 同卡同指纹限 1 条防灌水 (用户拍板)。
+     */
+    const val GRAFFITI_COMMENT_COST = 10L
 
     /** 交易明细保留条数 (每账户, 服务端) */
     const val TX_KEEP_PER_ACCOUNT = 100

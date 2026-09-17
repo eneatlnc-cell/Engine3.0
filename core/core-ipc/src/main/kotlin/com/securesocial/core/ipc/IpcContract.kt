@@ -27,12 +27,14 @@ import android.net.Uri
  * - 唤起导入:  myvault://import?session=<sessionId>&app=<callingPackage>
  * - 唤起验证:  myvault://verify?session=<sessionId>&app=<callingPackage>
  * - 签名请求:  myvault://sign?session=<sessionId>&app=<callingPackage>   (payload → EXTRA_PAYLOAD)
+ * - 静默签名:  myvault://signauto?session=<sessionId>&app=<callingPackage> (v3.51, payload → EXTRA_PAYLOAD)
  * - 钱包初始化: myvault://walletinit?session=<id>&app=<pkg>              (v3.37)
  * - 钱包签名:  myvault://signtx?session=<id>&app=<pkg>                   (v3.37, tx JSON → EXTRA_PAYLOAD)
  * - 账本对账:  myvault://walletstate?session=<id>&app=<pkg>              (v3.38, 免指纹摘要查询)
  * - 充值签名:  myvault://deposit?session=<id>&app=<pkg>                  (v3.38, DEPOSIT tx → EXTRA_PAYLOAD)
- * - 交接承接:  myvault://walletadopt?session=<id>&app=<pkg>              (v3.38, 证书 JSON → EXTRA_PAYLOAD)
+ * - 交接承接:  myvault://walletadopt?session=<id>&app=<pkg>              (v3.38, 证书 JSON → EXTRA_PAYLOAD; v3.72 已退役)
  * - 账本播种:  myvault://walletsync?session=<id>&app=<pkg>               (v3.38, 链 JSON → EXTRA_PAYLOAD)
+ * - 账本恢复:  myvault://walletrestore?session=<id>&app=<pkg>            (v3.72, 链 JSON → EXTRA_PAYLOAD)
  * - 成功回调:  myvault://callback?session=<id>&status=success&ts=<millis> (sig/result → EXTRA_SIG/EXTRA_RESULT)
  * - 失败回调:  myvault://callback?session=<id>&status=fail&code=<err>&ts=<millis> (sig → EXTRA_SIG)
  *
@@ -46,11 +48,69 @@ object IpcContract {
     const val HOST_CALLBACK = "callback"
     const val HOST_VERIFY = "verify"
     const val HOST_SIGN = "sign"
+
+    /**
+     * v3.51 静默签名入口 —— Engine 后台自动签名专用 (中继重连挑战应答 /
+     * 对方来信触发的 ECDH 信令应答)。
+     *
+     * 语义与 [HOST_SIGN] 的区别:
+     * · Vault 侧**永不唤起任何 Activity/指纹框** —— 仅尝试已解锁密钥
+     *   缓存 + Keystore 认证窗口两条静默路径;
+     * · 两条路径都不可用时回送 AUTH_REQUIRED 失败 (而非弹 UI),
+     *   Engine 侧排程延迟重试 (用户解锁屏幕/打开应用后自动恢复);
+     * · 无旧 startActivity 通道回退 —— 后台语义下绝不允许跨应用
+     *   跳转触发系统确认弹窗 (「频繁弹出 Engine 需要打开 Vault」
+     *   顽疾的根治点)。
+     */
+    const val HOST_SIGN_AUTO = "signauto"
+
     const val HOST_RESTORE = "restore"
 
     // ---- v3.37: SPARK 钱包 IPC 入口 ----
     /** 钱包密钥初始化: Vault 内生成钱包密钥对, 公钥经回调返回 (私钥永不离开 Vault) */
     const val HOST_WALLET_INIT = "walletinit"
+
+    /**
+     * v3.72 · P1-1 身份密钥初始化 (identityinit)。
+     *
+     * 历史漏洞 V3 封印: 旧流程身份密钥由 Engine 生成、私钥经签名通道
+     * 明文移交 Vault 导入 —— Engine 对私钥"瞬时持有", 移交通道即是
+     * 出口。本通道反转生成方: **Vault 进程内生成身份密钥对** (TEE
+     * 硬件不可导出, 与 walletinit 完全同构), 回调仅携带公钥 ——
+     * Engine 对身份私钥从"瞬时持有"变为**零接触**。
+     *
+     * - 幂等: 该应用已有绑定 (软件形态存量 / 硬件形态) 时直接返回
+     *   既有公钥, 不重新生成 (重新生成 = DID 漂移);
+     * - 结果仅公钥: 回调 result = Base64(X.509 公钥), 非秘密材料;
+     *   回调签名由新身份私钥签出 —— Engine 用该公钥验签即得私钥
+     *   持有证明 (与身份恢复 restore 同一验证语义);
+     * - 免弹私钥确认页: 无 payload, 指纹门后一步完成。
+     *
+     * 兼容: 老 Engine 继续走 HOST_IMPORT (importKey 保留为存量兼容
+     * 通道); 新 Engine 对老 Vault (本常量不存在) 由 Engine 侧回退
+     * 老通道, 见 KeyBindingViewModel。
+     */
+    const val HOST_IDENTITY_INIT = "identityinit"
+
+    /**
+     * v3.76.0 · P0 身份密钥轮换 (identityrotate)。
+     *
+     * 语义与 HOST_IDENTITY_INIT 的关键区别:
+     * - **非幂等**: 每次调用都生成全新的身份密钥对 (版本递增),
+     *   旧密钥签署轮换授权声明 (IdentityRotationStatement) —— 实现
+     *   子身份"重生"而**私钥永不离开 Vault TEE**;
+     * - **强制生物识别 (DR4)**: 始终弹指纹/面容, 不走 AuthGrantCache
+     *   静默路径 —— 身份轮换是高敏感操作, 30s 缓存窗口不可接受;
+     * - **回调携带双结果**: result = JSON { newPublicKey, rotationStatement },
+     *   其中 rotationStatement 由旧私钥签名, Engine 验证后通过 E2E 通道
+     *   传播给聊天对方, 对方据此完成联系人公钥迁移;
+     * - **版本化别名**: TEE 内新密钥使用 vault_identity_hw_<pkg>_v<N> 别名,
+     *   原子操作 (先建后删), 轮换中途失败不丢旧身份。
+     *
+     * 兼容: 旧 Vault 无此入口 → Engine 回退 legacyGenerateAndLaunch()
+     * (G1 已知缺陷: Engine 持有私钥); 旧 Engine 不发此请求 → 无影响。
+     */
+    const val HOST_IDENTITY_ROTATE = "identityrotate"
 
     /** 钱包交易签名: Engine 提交未签名交易 JSON, Vault 确认页渲染后用钱包私钥签名 */
     const val HOST_SIGN_TX = "signtx"
@@ -105,6 +165,31 @@ object IpcContract {
      */
     const val HOST_WALLET_SYNC = "walletsync"
 
+    /**
+     * v3.72 · P0-6 权威账本恢复 (walletrestore, 零出口保险箱恢复通道)。
+     *
+     * 场景: Vault 被「清除数据」—— 密钥槽/HWM/权威账本 (prefs + filesDir)
+     * 全灭, 但 AndroidKeyStore 硬件签名密钥幸存 (系统分区, 清数据不删)。
+     * Engine 的分布式镜像 (全量已签名链) 是唯一幸存账本副本, 经本通道
+     * 提交回填。恢复闭环: walletstate(NO_KEY) → walletinit (Keystore 命中,
+     * 同一公钥写回) → 镜像验签继续有效 → walletrestore (镜像链回填) →
+     * 资产完整复活 —— 权威账本的"云"即应用端分布式镜像 (零上云)。
+     *
+     * 验签规则 (Vault 侧, 零信任 Engine):
+     * - 与 walletsync 同源: 全链签名/链接/序号/足额校验 + 权威账本
+     *   非空拒绝 (AlreadySeeded, 不可覆盖);
+     * - HWM 语义放宽: 恢复场景 HWM 可能已灭失归零, 拒绝条件为
+     *   「链尾 seq < HWM」(HWM 幸存但链更旧 = 回滚/截断, fail-closed);
+     *   链尾 ≥ HWM 均受理, 成功后 HWM 落为链尾 seq;
+     * - 公钥来源: 公钥槽灭失时从 Keystore 硬件密钥对取回 (幂等命中)
+     *   并写回 —— 与 walletinit 构成密钥复活通道。
+     *
+     * 残余面 (诚实边界): 与 walletsync 同 —— 提交链若为真实链前缀
+     * (隐藏尾部支出), 权威余额被高估; 一次性窗口, 恢复完成后窗口闭合
+     * (此后每笔交易由 Vault 独立记账)。
+     */
+    const val HOST_WALLET_RESTORE = "walletrestore"
+
     const val PARAM_SESSION = "session"
     const val PARAM_STATUS = "status"
     const val PARAM_CODE = "code"
@@ -117,6 +202,15 @@ object IpcContract {
     /** v3.39: walletstate 全链拉取开关 (full=1 → 应答携带 chainJson) */
     const val PARAM_FULL = "full"
 
+    /**
+     * v3.50: walletinit 强制独立指纹开关 (forceauth=1)。
+     *
+     * 引导流语义: 身份绑定与钱包初始化是两次独立签名 —— 该参数使
+     * Vault 撤销 30s 授权缓存, WalletInitActivity 必弹指纹。
+     * 旧客户端不带此参数 → 默认 false, 行为完全不变 (兼容)。
+     */
+    const val PARAM_FORCE_AUTH = "forceauth"
+
     const val STATUS_SUCCESS = "success"
     const val STATUS_FAIL = "fail"
 
@@ -127,6 +221,24 @@ object IpcContract {
 
     /** Engine 应用包名: Vault 发起的回调 Intent 必须锁定此包名 */
     const val ENGINE_PACKAGE = "com.engine"
+
+    /**
+     * v3.49 钱包全局化: 全局钱包槽键 (专用键, 非 applicationId —— 不可
+     * 能与任何真实应用包名碰撞)。
+     *
+     * Vault 侧钱包密钥 / 权威账本 / 高水位 / 交接 / 销毁**全部路由此
+     * 槽** —— 唯一钱包, 应用 (Engine 及未来任何应用) 是钱包的授权
+     * 使用者而非持有人。身份密钥仍按应用包名分槽 (PrivateKeyManager,
+     * 隔离语义不变); 钱包签名授权窗口 (AuthGrantCache) 仍按发起应用
+     * 记账 —— 谁的门验证的谁消费, 操作对象恒为全局钱包。
+     *
+     * 兼容: 旧版 Vault 的 per-app 槽 (wallet_*<pkg>) 由一次性迁移
+     * 收编 (移动语义); PARAM_APP 包名不再参与钱包槽路由, 但自
+     * v3.49 起作为**交易来源归属** (WalletTx.source) 的注入输入 ——
+     * Binder 通道经 VaultIpcService 按 uid 复核 (申报别家包名即
+     * 拒绝), 签名时覆盖载荷自报值。新旧客户端任意混布。
+     */
+    const val GLOBAL_WALLET_SLOT = "wallet.global"
 
     /**
      * Vault 侧 signature 级自定义权限。
@@ -314,6 +426,30 @@ object IpcContract {
         uri.scheme == SCHEME && uri.host == HOST_SIGN
 
     /**
+     * v3.51 构建 "静默签名" 请求 URI (仅路由字段, 与 sign 同构)。
+     *
+     * 待签字节 (Base64) 经 Intent Extra (EXTRA_PAYLOAD) 投递。
+     * 仅 Vault 的 VaultIpcService Binder 通道受理 —— 无 Activity
+     * intent-filter, 无旧通道回退 (静默专用语义)。
+     */
+    fun buildSignAutoUri(
+        sessionId: String,
+        appPackage: String = ENGINE_PACKAGE
+    ): String {
+        return Uri.Builder()
+            .scheme(SCHEME)
+            .authority(HOST_SIGN_AUTO)
+            .appendQueryParameter(PARAM_SESSION, sessionId)
+            .appendQueryParameter(PARAM_APP, appPackage)
+            .build()
+            .toString()
+    }
+
+    /** 检查 URI 是否为静默签名请求 (v3.51) */
+    fun isSignAutoUri(uri: Uri): Boolean =
+        uri.scheme == SCHEME && uri.host == HOST_SIGN_AUTO
+
+    /**
      * v3.6 构建 "身份恢复" 唤起 URI。
      *
      * 场景: Engine 清除数据 / 换机重装后本地绑定身份丢失, 但 Vault 仍持有
@@ -357,12 +493,22 @@ object IpcContract {
      * 安全模型与 restore 一致: 回调受 ENGINE_CALLBACK signature 权限
      * 保护 + 身份绑定私钥对 (sessionId ‖ status ‖ ts ‖ result) 签名。
      */
-    fun buildWalletInitUri(sessionId: String, appPackage: String = ENGINE_PACKAGE): String {
+    fun buildWalletInitUri(
+        sessionId: String,
+        appPackage: String = ENGINE_PACKAGE,
+        /** v3.50: true → Vault 撤销授权缓存, 强制独立指纹 (引导流第二步) */
+        forceAuth: Boolean = false
+    ): String {
         return Uri.Builder()
             .scheme(SCHEME)
             .authority(HOST_WALLET_INIT)
             .appendQueryParameter(PARAM_SESSION, sessionId)
             .appendQueryParameter(PARAM_APP, appPackage)
+            .apply {
+                if (forceAuth) {
+                    appendQueryParameter(PARAM_FORCE_AUTH, "1")
+                }
+            }
             .build()
             .toString()
     }
@@ -527,4 +673,71 @@ object IpcContract {
     /** 检查 URI 是否为权威账本播种请求 */
     fun isWalletSyncUri(uri: Uri): Boolean =
         uri.scheme == SCHEME && uri.host == HOST_WALLET_SYNC
+
+    /**
+     * v3.72 · P0-6 构建 "权威账本恢复" 唤起 URI (仅路由字段)。
+     *
+     * 载荷与 walletsync 完全一致 (完整已签名链 JSON via EXTRA_PAYLOAD),
+     * 仅 host 不同 —— Vault 侧按 host 分流 seed/restore 两套 HWM 语义。
+     */
+    fun buildWalletRestoreUri(sessionId: String, appPackage: String = ENGINE_PACKAGE): String {
+        return Uri.Builder()
+            .scheme(SCHEME)
+            .authority(HOST_WALLET_RESTORE)
+            .appendQueryParameter(PARAM_SESSION, sessionId)
+            .appendQueryParameter(PARAM_APP, appPackage)
+            .build()
+            .toString()
+    }
+
+    /** 检查 URI 是否为权威账本恢复请求 */
+    fun isWalletRestoreUri(uri: Uri): Boolean =
+        uri.scheme == SCHEME && uri.host == HOST_WALLET_RESTORE
+
+    /**
+     * v3.72 · P1-1 构建 "身份密钥初始化" 唤起 URI (仅路由字段, 无载荷)。
+     *
+     * Vault 进程内生成身份密钥对 (TEE 硬件), 回调 result = Base64(X.509
+     * 公钥) + 新私钥签名 —— Engine 用公钥验签得私钥持有证明。失败码:
+     * KEYSTORE_ERROR (生成失败) / BIOMETRIC_* (指纹门)。
+     */
+    fun buildIdentityInitUri(sessionId: String, appPackage: String = ENGINE_PACKAGE): String {
+        return Uri.Builder()
+            .scheme(SCHEME)
+            .authority(HOST_IDENTITY_INIT)
+            .appendQueryParameter(PARAM_SESSION, sessionId)
+            .appendQueryParameter(PARAM_APP, appPackage)
+            .build()
+            .toString()
+    }
+
+    /** 检查 URI 是否为身份密钥初始化请求 */
+    fun isIdentityInitUri(uri: Uri): Boolean =
+        uri.scheme == SCHEME && uri.host == HOST_IDENTITY_INIT
+
+    /**
+     * v3.76.0 · P0 构建 "身份密钥轮换" 唤起 URI (仅路由字段, 无载荷)。
+     *
+     * Vault 在强制生物识别门后:
+     * 1. 取出该应用当前身份密钥对 (旧密钥);
+     * 2. 在 TEE 内生成新身份密钥对 (版本化别名);
+     * 3. 用旧私钥签署 IdentityRotationStatement (旧指纹→新指纹→新公钥→时间戳);
+     * 4. 删除旧 TEE 密钥条目 (原子操作保障);
+     * 5. 回调 result = JSON { newPublicKey: Base64(X.509), rotationStatement: Base64 }。
+     *
+     * DR4: 始终强制生物识别, 忽略 AuthGrantCache。
+     */
+    fun buildIdentityRotateUri(sessionId: String, appPackage: String = ENGINE_PACKAGE): String {
+        return Uri.Builder()
+            .scheme(SCHEME)
+            .authority(HOST_IDENTITY_ROTATE)
+            .appendQueryParameter(PARAM_SESSION, sessionId)
+            .appendQueryParameter(PARAM_APP, appPackage)
+            .build()
+            .toString()
+    }
+
+    /** 检查 URI 是否为身份密钥轮换请求 (v3.76.0) */
+    fun isIdentityRotateUri(uri: Uri): Boolean =
+        uri.scheme == SCHEME && uri.host == HOST_IDENTITY_ROTATE
 }

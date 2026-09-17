@@ -134,6 +134,18 @@ object WalletGrant {
 }
 
 /**
+ * 交易来源归属保留字 (v3.49)。
+ *
+ * source 字段取值为发起应用包名 (com.engine 及未来同证书应用) 或本
+ * 保留字 —— [VAULT] 表示操作由 Vault 自身发起 (交接出账 / 承接 GENESIS),
+ * 不归属任何应用。
+ */
+object TxSource {
+    /** Vault 内部操作 (非应用发起) */
+    const val VAULT = "vault"
+}
+
+/**
  * 一笔签名交易。JSON 形态用于落盘与 IPC 载荷; 签名对象是
  * [TxCanonical.bytes] 的规范化字节 (字段定序 + 长度前缀,
  * 与 JSON 序列化的字段顺序/空白完全无关 —— 签名永不因
@@ -145,6 +157,11 @@ object WalletGrant {
  * @param memo         业务线索 ("daily-grant:2026-08-27" / "msg×5" / "tip:a1b2c3d4" / "handover:1:<hash>")
  * @param prevTxHash   前一笔交易的 [WalletTx.txHash]; 首笔为 ""
  * @param signature    Base64(DER ECDSA-P256) 对 [TxCanonical.bytes] 的签名
+ * @param source       v3.49 来源归属: 发起应用包名 / [TxSource.VAULT] / null(旧链)。
+ *                     **未签名元数据列** —— 不进 [TxCanonical] 签名域, 由
+ *                     Vault 在签名时注入 (调用方自报无效, 见 WalletKeyManager):
+ *                     一钱包一总账模型下, 记录 "这笔 SPARK 变动由哪个应用
+ *                     发起"。旧链交易解码为 null, 展示为 "未知 (升级前)"。
  */
 @Serializable
 data class WalletTx(
@@ -156,6 +173,7 @@ data class WalletTx(
     val timestamp: Long,
     val prevTxHash: String = "",
     val signature: String = "",
+    val source: String? = null,
 ) {
     /** 本交易的哈希: SHA-256(规范化字节 ‖ 签名字节) 的 hex —— 链式链接材料 */
     val txHash: String
@@ -174,6 +192,15 @@ data class WalletTx(
      * | DEPOSIT       | −a      | +a     |
      * | WITHDRAW      | +a      | −a     |
      * | HANDOVER      | −a      | 0      |
+     * |
+     * |---------------|---------|--------|
+     * ⚠ 边界 (v3.39 total 语义, 修复 B-5): HANDOVER 全额移交 **total** 时,
+     * effects() 的 custody 分量为 −a; 在 running 推导上下文中, 单分量可按
+     * "custody += eff.custody" 被算成负值 (例: custody 2000 → handover 4500
+     * ⇒ custody = −2500)。这仅是**推导中间值, 不用于任何余额消费** —— 支出/
+     * 足额/展示一律取 [WalletBalances.total] (恒 ≥ 0)。若未来任何调用方直接
+     * 消费 custody/margin 单分量, 必须先对分量做 **max(0) 钳制**, 否则会读到
+     * 负余额语义; 现有 total 校验保持不变。
      */
     fun effects(): WalletBalances = WalletBalances(
         custody = when (type) {
@@ -214,6 +241,15 @@ data class WalletTx(
  * ```
  * 签名域前缀与既有 "SIGNAL-V1" / "RELAY-AUTH-V1" 互斥 ——
  * 身份域签名绝不可能被重放为钱包交易签名 (跨协议重放防护)。
+ *
+ * v3.49 source 列排除声明: [WalletTx.source] (来源归属) **不进本
+ * 签名域** —— 余额/序号/链接等安全核心仍由签名覆盖, source 是
+ * Vault 侧注入的审计展示列。代价与边界 (如实): root 级篡改账本
+ * JSON 的 source 值不触发验签失败 —— 但能写 Vault 私有目录的攻击
+ * 者本可重写整本账本, source 并未降低既有安全水位; 收益: 签名域
+ * 字节布局对 v3.37~v3.44 全部已签链逐字节稳定, 新旧版本任意混布
+ * (旧端验签/新端验签/镜像校验互认), 链式 txHash 亦不受 source
+ * 影响 —— prevTxHash 链接跨版本成立。
  *
  * v3.38 兼容性: 帧格式**未变** —— 新交易类型只是新的类型名字符串
  * (长度前缀设计), v3.37 已签交易的规范化字节与其签名保持逐字节

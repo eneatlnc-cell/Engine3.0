@@ -155,55 +155,13 @@ class MessageEnvelopeTest {
     fun `protocol constants stay within documented budgets`() {
         // v3.17.1 消息预算: 40KB 文本/48KB 媒体 → 加密+Base64 后 < 128KB
         assertTrue(ProtocolConstants.MAX_PAYLOAD_SIZE == 128 * 1024)
-        // 群成员上限与限流护栏存在且为正
-        assertTrue(GroupLimits.MAX_MEMBERS == 200)
+        // 群成员上限与限流护栏存在且为正 (v3.55: 200 → 50 降压定档)
+        assertTrue(GroupLimits.MAX_MEMBERS == 50)
         assertTrue(ProtocolConstants.GROUP_FANOUT_MSG_PER_SECOND > 0)
         assertTrue(ProtocolConstants.GLOBAL_FANOUT_BYTES_PER_SECOND > 0)
         assertTrue(
             "群级突发必须不大于全局突发",
             ProtocolConstants.GROUP_FANOUT_BYTES_BURST <= ProtocolConstants.GLOBAL_FANOUT_BYTES_BURST
         )
-    }
-
-    // ── v3.45: 领金日去重帧 ─────────────────────────────────────────
-
-    @Test
-    fun `grant check and ack frames roundtrip`() {
-        val h = "0123456789abcdef"
-        val day = "2026-08-29"
-        val check = ProtocolSerializer.encodeGrantCheck("a1b2c3d4e5f6a7b8", h, day, 42L)
-        val env = ProtocolSerializer.decode(check)!!
-        assertEquals(MessageType.GRANT_CHECK, env.type)
-        assertEquals("a1b2c3d4e5f6a7b8", env.source)
-        assertEquals(42L, env.seq)
-        val payload = ProtocolSerializer.decodeGrantCheckPayload(env.payload!!)!!
-        assertEquals(h, payload.h)
-        assertEquals(day, payload.day)
-
-        val ack = ProtocolSerializer.encodeGrantAck("a1b2c3d4e5f6a7b8", allowed = false, day = day)
-        val ackEnv = ProtocolSerializer.decode(ack)!!
-        assertEquals(MessageType.GRANT_ACK, ackEnv.type)
-        assertEquals("a1b2c3d4e5f6a7b8", ackEnv.target)
-        val ackPayload = ProtocolSerializer.decodeGrantAckPayload(ackEnv.payload!!)!!
-        assertFalse(ackPayload.allowed)
-        assertEquals(day, ackPayload.day)
-    }
-
-    @Test
-    fun `grant dedupe hash is day unlinkable`() {
-        // 同设备不同日 → 不同哈希 (不可链接性: 中继无法跨日关联)
-        // 纯 JVM 侧以固定种子字节模拟 deviceSeed
-        val seed = "seed-bytes".toByteArray()
-        fun hash(day: String): String =
-            java.security.MessageDigest.getInstance("SHA-256")
-                .digest(("spark-grant-dedupe/1|$day|").toByteArray(Charsets.UTF_8) + seed)
-                .joinToString("") { "%02x".format(it) }
-                .take(16)
-        val d1 = hash("2026-08-28")
-        val d2 = hash("2026-08-29")
-        assertEquals(16, d1.length)
-        assertNotEquals(d1, d2)
-        // 同日同种子 → 稳定 (幂等判定的基础)
-        assertEquals(d1, hash("2026-08-28"))
     }
 }

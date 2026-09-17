@@ -134,12 +134,39 @@ data class HandoverCertificate(
     }
 
     /**
+     * 旧链尾交叉校验信息 (修复 B-3) —— 由调用方从权威旧账本/旧机提供。
+     *
+     * 传入后 [verify] 会把交接交易与旧链做交叉校验, 消除"只验签、
+     * 不证明 handoverTx 确是旧链尾"的盲区:
+     * - prevTxHash 必须 == 旧链尾哈希 (确保 handoverTx 链接在旧链末端);
+     * - seq 必须 == 旧链尾 seq + 1 (确保序号衔接, 不重放/不跳号);
+     * - amount 必须 == 旧链权威 total 余额 (不再纯信任证书内快照)。
+     *
+     * 未提供 (为 null, 保持旧接口签名兼容) 时, verify 仍通过但仅验
+     * 结构 + 签名, amount 视为旧机自报快照 —— 信任边界见 [verify] 头注。
+     */
+    data class OldChainTail(
+        val tailTxHash: String,
+        val tailSeq: Long,
+        val totalBalance: Long,
+    )
+
+    /**
      * 新机侧验证 (零信任 — 只信密码学, 不信扫码通道):
      * 1. 载荷结构: kind/version/公钥可解码/交易类型与金额;
      * 2. 交易 counterparty == 本机新公钥 hex (防调包);
-     * 3. 旧公钥对交接交易规范化字节的签名 (域分离验签)。
+     * 3. 旧公钥对交接交易规范化字节的签名 (域分离验签);
+     * 4. 可选 [oldChainTail]: 由调用方传旧链尾信息时, 交叉校验
+     *    handoverTx 的 prevTxHash/seq/amount 确与旧链尾一致。
+     *
+     * 信任边界 (未传 oldChainTail 时绕过第 4 步): 证书只含旧公钥/
+     * 新公钥/交接交易本体, 无旧链历史 —— 密码学上能证明"这段交易
+     * 由旧密钥签名、且只签给本机", 但**无法独立证明 amount 确为旧链
+     * 真实余额快照** (纯信任旧机自报)。产品建议: 调用方在能取到旧链
+     * (权威账本) 时一律传入 [OldChainTail] 做交叉校验; 取不到旧链时
+     * 依赖新链承接后对新链 GENESIS 做整链校验作为兜底。
      */
-    fun verify(localNewPubKeyX509: ByteArray): VerifyResult {
+    fun verify(localNewPubKeyX509: ByteArray, oldChainTail: OldChainTail? = null): VerifyResult {
         if (kind != KIND || v != 1)
             return VerifyResult.Bad("交接证书版本不识别")
         if (handoverTx.type != TxType.HANDOVER)
@@ -163,8 +190,6 @@ data class HandoverCertificate(
             return VerifyResult.Bad("旧公钥无法解析")
         }
 
-        // 旧公钥 hex (新链 GENESIS 的 counterparty 线索)
-        val oldHex = pubKeyHex(oldPubBytes)
         if (handoverTx.counterparty != localHex)
             return VerifyResult.Bad("交接交易对手方与本机公钥不符")
 
@@ -177,7 +202,17 @@ data class HandoverCertificate(
         if (!ecdsa.verify(oldPubKey, TxCanonical.bytes(handoverTx), sig))
             return VerifyResult.Bad("旧密钥签名验证失败 (证书被篡改?)")
 
-        if (oldHex.isEmpty()) return VerifyResult.Bad("旧公钥为空")
+        // 旧链尾交叉校验 (B-3): 调用方提供权威旧链信息时, 确认交接交易
+        // 确为旧链末笔且金额与旧链权威余额一致, 而非纯信任证书快照。
+        oldChainTail?.let { tail ->
+            if (handoverTx.prevTxHash != tail.tailTxHash)
+                return VerifyResult.Bad("交接交易未链接到旧链尾 (prevTxHash 不符)")
+            if (handoverTx.seq != tail.tailSeq + 1L)
+                return VerifyResult.Bad("交接交易序号与旧链尾不衔接")
+            if (handoverTx.amount != tail.totalBalance)
+                return VerifyResult.Bad("交接金额与旧链权威余额不符 (证书快照被篡改?)")
+        }
+
         return VerifyResult.Ok(
             balanceCarried = handoverTx.amount,
             handoverTxHash = handoverTx.txHash,

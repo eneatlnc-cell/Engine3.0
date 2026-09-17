@@ -65,13 +65,14 @@ object ProtocolSerializer {
         return encode(envelope)
     }
 
-    fun encodeMsg(source: String, target: String, payload: String, seq: Long): String {
+    fun encodeMsg(source: String, target: String, payload: String, seq: Long, ring: Int = 0): String {
         return encode(MessageEnvelope(
             type = MessageType.MSG,
             source = source,
             target = target,
             payload = payload,
-            seq = seq
+            seq = seq,
+            ring = ring
         ))
     }
 
@@ -235,6 +236,43 @@ object ProtocolSerializer {
         json.decodeFromString(GrantAckPayload.serializer(), payload)
     } catch (e: Exception) { null }
 
+    // ==================== v3.74: 双花探针认领 (DUP_CLAIM) ====================
+
+    /**
+     * DUP_CLAIM - 序号认领 (客户端 → 中继, 独立不认证端点)。
+     *
+     * **不携带 source 指纹** —— 见 [DupClaimPayload] 头注的隐私契约:
+     * 认证头会让中继把 probe 绑定到身份, 盲化收益归零。
+     */
+    fun encodeDupClaim(probe: String, id: String, seq: Long = 0L): String {
+        return encode(MessageEnvelope(
+            type = MessageType.DUP_CLAIM,
+            payload = json.encodeToString(DupClaimPayload(probe, id)),
+            seq = seq
+        ))
+    }
+
+    /**
+     * DUP_CLAIM_RESULT - 中继应答 (三态, v3.74.1):
+     * granted=true 首次认领 / false 已被认领 (疑似双花) / null 服务暂不可用
+     * (存储故障; 客户端按"结果未知"宽松降级 —— 中继故障时绝不放行也绝不谎报)。
+     * granted=null 时该字段不上线 (explicitNulls=false), 线格式为字段缺省。
+     */
+    fun encodeDupClaimResult(probe: String, granted: Boolean?, id: String): String {
+        return encode(MessageEnvelope(
+            type = MessageType.DUP_CLAIM_RESULT,
+            payload = json.encodeToString(DupClaimResultPayload(probe, granted, id))
+        ))
+    }
+
+    fun decodeDupClaimPayload(payload: String): DupClaimPayload? = try {
+        json.decodeFromString(DupClaimPayload.serializer(), payload)
+    } catch (e: Exception) { null }
+
+    fun decodeDupClaimResultPayload(payload: String): DupClaimResultPayload? = try {
+        json.decodeFromString(DupClaimResultPayload.serializer(), payload)
+    } catch (e: Exception) { null }
+
     // ==================== v3.14: 群组消息与控制 ====================
 
     /**
@@ -248,7 +286,8 @@ object ProtocolSerializer {
         target: String,
         groupId: String,
         payload: String,
-        seq: Long
+        seq: Long,
+        ring: Int = 0
     ): String {
         return encode(MessageEnvelope(
             type = MessageType.GROUP_MSG,
@@ -256,7 +295,8 @@ object ProtocolSerializer {
             target = target,
             payload = payload,
             seq = seq,
-            groupId = groupId
+            groupId = groupId,
+            ring = ring
         ))
     }
 
@@ -350,4 +390,196 @@ object ProtocolSerializer {
      */
     fun encodeGroupCtrlJson(ctrl: GroupCtrlPayload): String =
         json.encodeToString(GroupCtrlPayload.serializer(), ctrl)
+
+    // ==================== v3.53: 离线投递回执 ====================
+
+    /**
+     * MSG_ACK - 中继对 MSG/GROUP_MSG 发送方的投递回执 (中继 → 发送方)
+     *
+     * status: MsgAckStatus.QUEUED (目标离线已入队) /
+     *         MsgAckStatus.DELIVERED (已投递) /
+     *         MsgAckStatus.REJECTED (被拒)
+     */
+    fun encodeMsgAck(target: String, ack: MsgAckPayload): String {
+        return encode(MessageEnvelope(
+            type = MessageType.MSG_ACK,
+            target = target,
+            payload = json.encodeToString(ack)
+        ))
+    }
+
+    /**
+     * MSG_ACK (端到端回执, v3.66) - 接收方 B → 中继 → 原发送方 A
+     *
+     * 与 [encodeMsgAck] (中继合成, 无 source) 的区别: 本信封由**接收方客户端**
+     * 发出 —— envelope.source = B (中继据此校验身份), envelope.target = A
+     * (原发送方, 中继据此路由), payload.seq = 被确认消息的原始 seq,
+     * payload.target = B (被回执消息的目标, A 端 removeDesyncSend 匹配键)。
+     *
+     * 语义: 「该帧已真实到达 B 的进程」—— 关闭中继侧「写入 socket 缓冲 =
+     * 已送达」的黑洞窗口 (移动网络僵尸连接下, 缓冲写成功 ≠ 对端收到)。
+     * 中继收到后: ① 按指纹+seq 冲账冲刷未确认登记; ② 转发给 A, A 离线则
+     * 入 A 的离线队列待其上线冲刷 (与中继自产的 DELIVERED 回执同收敛点,
+     * A 端 handleMsgAck 幂等)。
+     *
+     * 仅 status=DELIVERED 一种取值 (客户端只确认收妥, 不产生其他语义)。
+     */
+    fun encodeE2eMsgAck(source: String, target: String, seq: Long, ackTarget: String): String {
+        return encode(MessageEnvelope(
+            type = MessageType.MSG_ACK,
+            source = source,
+            target = target,
+            payload = json.encodeToString(
+                MsgAckPayload(
+                    status = MsgAckStatus.DELIVERED,
+                    seq = seq,
+                    target = ackTarget,
+                    ts = System.currentTimeMillis()
+                )
+            )
+        ))
+    }
+
+    /**
+     * QUEUE_FULL - 目标离线队列已满, 消息被拒 (中继 → 发送方)
+     *
+     * 独立信封而非 MSG_ACK(rejected): 客户端可区分「投递失败可重试」
+     * 与「中继代管已达上限, 继续发送无意义」, 前者 UI 提示重试,
+     * 后者提示等待对端上线清空队列。
+     */
+    fun encodeQueueFull(target: String, seq: Long, queueTarget: String): String {
+        return encode(MessageEnvelope(
+            type = MessageType.QUEUE_FULL,
+            target = target,
+            seq = seq,
+            payload = json.encodeToString(
+                MsgAckPayload(
+                    status = MsgAckStatus.REJECTED,
+                    seq = seq,
+                    target = queueTarget,
+                    ts = System.currentTimeMillis()
+                )
+            )
+        ))
+    }
+
+    fun decodeMsgAckPayload(payload: String): MsgAckPayload? = try {
+        json.decodeFromString(MsgAckPayload.serializer(), payload)
+    } catch (e: Exception) { null }
+
+    // ==================== v3.56: 涂鸦墙 ====================
+
+    /**
+     * GRAFFITI_POST - 发布涂鸦留言卡 (客户端 → 中继)
+     *
+     * payload 为 GraffitiCardPayload 明文 JSON (公开内容不加密);
+     * 中继校验 author == source、词元 ≤ 300、节奏护栏后入墙,
+     * 并向订阅集广播 GRAFFITI_CARD (含作者本人 —— 回显即受理回执,
+     * 客户端「确认后扣费」的锚点, 与 MSG_ACK 计费契约同构)。
+     */
+    fun encodeGraffitiPost(card: GraffitiCardPayload): String {
+        return encode(MessageEnvelope(
+            type = MessageType.GRAFFITI_POST,
+            source = card.author,
+            payload = json.encodeToString(card)
+        ))
+    }
+
+    /**
+     * GRAFFITI_SUBSCRIBE - 订阅涂鸦墙 (客户端 → 中继)
+     *
+     * 幂等: 打开涂鸦页/重连后各发一次即可。订阅语义:
+     * · 入实时广播集 (会话态, 断开即除名);
+     * · 领取当前墙快照 (≤24h 存活卡片, 限速冲刷)。
+     */
+    fun encodeGraffitiSubscribe(source: String): String {
+        return encode(MessageEnvelope(
+            type = MessageType.GRAFFITI_SUBSCRIBE,
+            source = source
+        ))
+    }
+
+    /**
+     * GRAFFITI_CARD - 涂鸦卡片帧 (中继 → 客户端)
+     *
+     * 实时广播 / 订阅快照 / 作者回显共用本帧型; 接收端按
+     * card.id 幂等去重, 按 card.ts + GRAFFITI_TTL_MS 判过期。
+     */
+    fun encodeGraffitiCard(card: GraffitiCardPayload): String {
+        return encode(MessageEnvelope(
+            type = MessageType.GRAFFITI_CARD,
+            source = card.author,
+            payload = json.encodeToString(card)
+        ))
+    }
+
+    fun decodeGraffitiCardPayload(payload: String): GraffitiCardPayload? = try {
+        json.decodeFromString(GraffitiCardPayload.serializer(), payload)
+    } catch (e: Exception) { null }
+
+    // ==================== v3.81: 涂鸦墙留言 / 浏览 / 分页 ====================
+
+    /**
+     * GRAFFITI_COMMENT - 卡片留言 (客户端 → 中继)
+     *
+     * 中继校验链: 卡在墙未过期 → 同卡同指纹限 1 条 → 词元 ≤100 →
+     * 全局冷却 10s → author == 认证身份。受理后追加留言并向全部
+     * 订阅者广播**更新后的整卡** (含给留言者的回显 —— 客户端
+     * 「确认后扣费」10 SPARK 的锚点, 与发帖 100k 同构)。
+     */
+    fun encodeGraffitiComment(source: String, cardId: String, text: String): String {
+        return encode(MessageEnvelope(
+            type = MessageType.GRAFFITI_COMMENT,
+            source = source,
+            payload = json.encodeToString(GraffitiCommentReqPayload(cardId, text))
+        ))
+    }
+
+    /**
+     * GRAFFITI_VIEW - 浏览上报 (客户端 → 中继)
+     *
+     * 打开卡片详情时发送; 中继按 (卡, 指纹) 去重计数, 更新卡
+     * 仅定向回给请求会话 (不广播 —— 浏览数非实时协作语义,
+     * 其他人下次打开详情/翻页时自然拿到新值)。
+     */
+    fun encodeGraffitiView(source: String, cardId: String): String {
+        return encode(MessageEnvelope(
+            type = MessageType.GRAFFITI_VIEW,
+            source = source,
+            payload = json.encodeToString(GraffitiViewReqPayload(cardId))
+        ))
+    }
+
+    /** GRAFFITI_MORE - 快照翻页 (客户端 → 中继: 自 offset 续领一页) */
+    fun encodeGraffitiMore(source: String, offset: Int): String {
+        return encode(MessageEnvelope(
+            type = MessageType.GRAFFITI_MORE,
+            source = source,
+            payload = json.encodeToString(GraffitiMorePayload(offset))
+        ))
+    }
+
+    /** GRAFFITI_PAGE_END - 页末标记 (中继 → 客户端, 见载荷头注) */
+    fun encodeGraffitiPageEnd(page: GraffitiPageEndPayload): String {
+        return encode(MessageEnvelope(
+            type = MessageType.GRAFFITI_PAGE_END,
+            payload = json.encodeToString(page)
+        ))
+    }
+
+    fun decodeGraffitiCommentReq(payload: String): GraffitiCommentReqPayload? = try {
+        json.decodeFromString(GraffitiCommentReqPayload.serializer(), payload)
+    } catch (e: Exception) { null }
+
+    fun decodeGraffitiViewReq(payload: String): GraffitiViewReqPayload? = try {
+        json.decodeFromString(GraffitiViewReqPayload.serializer(), payload)
+    } catch (e: Exception) { null }
+
+    fun decodeGraffitiMore(payload: String): GraffitiMorePayload? = try {
+        json.decodeFromString(GraffitiMorePayload.serializer(), payload)
+    } catch (e: Exception) { null }
+
+    fun decodeGraffitiPageEnd(payload: String): GraffitiPageEndPayload? = try {
+        json.decodeFromString(GraffitiPageEndPayload.serializer(), payload)
+    } catch (e: Exception) { null }
 }

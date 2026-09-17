@@ -32,6 +32,21 @@ class AesGcmCipher {
 
         /** 消息加密 AAD 的域分隔符: 防止不同用途的 GCM 输出被交叉使用 */
         const val MSG_AAD_DOMAIN = "ENGINE-MSG-V1"
+
+        /**
+         * 复用的单一 SecureRandom (Javadoc 明确实例线程安全)。
+         *
+         * 修复 A-2: 旧实现每次加密都 `new SecureRandom()` 且随机 12B IV ——
+         * 重复实例化、熵质量与 (key, iv) 冲突概率均不理想。改为进程内
+         * 共享一个实例; 并且把 IV 一并纳入 AAD (见 [combineAadWithIv]),
+         * 使 (key, iv, aad) 三方绑定, 双保险杜绝 IV 复用/冲突。
+         */
+        private val secureRandom = java.security.SecureRandom()
+
+        /** 调用方 AAD ‖ IV (12B) 拼接 —— encrypt/decrypt 两侧必须逐字节一致。
+         *  aad 为 null 时仍以 IV 单独作为认证数据, 绑定 (key, iv)。 */
+        private fun combineAadWithIv(aad: ByteArray?, iv: ByteArray): ByteArray? =
+            if (aad == null) iv.copyOf() else aad + iv
     }
 
     /**
@@ -92,11 +107,12 @@ class AesGcmCipher {
      */
     fun encrypt(plaintext: ByteArray, key: SecretKey, aad: ByteArray? = null): EncryptedPayload {
         val cipher = Cipher.getInstance(TRANSFORMATION)
-        val iv = ByteArray(IV_LENGTH_BYTES).also {
-            java.security.SecureRandom().nextBytes(it)
-        }
+        val iv = ByteArray(IV_LENGTH_BYTES).also { secureRandom.nextBytes(it) }
         cipher.init(Cipher.ENCRYPT_MODE, key, GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv))
-        if (aad != null) cipher.updateAAD(aad)
+        // IV 一并纳入认证数据 (与 decrypt 侧对称): (key, iv, aad) 三方绑定,
+        // 共享随机源下 IV 若被复用也会因 AAD 不同而认证失败 (防冲突双保险)。
+        val effectiveAad = combineAadWithIv(aad, iv)
+        if (effectiveAad != null) cipher.updateAAD(effectiveAad)
         // GCM 模式下, doFinal 返回密文 + AuthTag 的拼接
         val cipherOutput = cipher.doFinal(plaintext)
         val ciphertext = cipherOutput.copyOf(cipherOutput.size - GCM_TAG_LENGTH_BITS / 8)
@@ -115,7 +131,9 @@ class AesGcmCipher {
     fun decrypt(payload: EncryptedPayload, key: SecretKey, aad: ByteArray? = null): ByteArray {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(GCM_TAG_LENGTH_BITS, payload.iv))
-        if (aad != null) cipher.updateAAD(aad)
+        // 与 encrypt 侧对称: AAD 内同样拼入 IV, 否则 IV-入-AAD 的密文解密必失败
+        val effectiveAad = combineAadWithIv(aad, payload.iv)
+        if (effectiveAad != null) cipher.updateAAD(effectiveAad)
         // GCM 解密需要密文 + AuthTag 拼接
         val combined = payload.ciphertext + payload.authTag
         return cipher.doFinal(combined)

@@ -16,7 +16,20 @@ enum class IpcErrorCode(val code: String, val description: String) {
     NO_BINDING("NO_BINDING", "Vault 中没有该应用的可恢复身份, 请直接生成新密钥对"),
     SIGN_FAILED("SIGN_FAILED", "签名失败 (载荷格式错误或密码学异常)"),
     SIGN_TIMEOUT("SIGN_TIMEOUT", "签名请求超时 (Vault 未响应)"),
+    /**
+     * v3.51 静默签名 (signauto) 专用: Vault 的已解锁密钥缓存未命中且
+     * Keystore 认证窗口关闭 —— 需要用户完成一次验证 (解锁屏幕或打开
+     * 应用) 才能恢复自动签名。Engine 收到后应排程延迟重试而非放弃,
+     * 绝不据此弹 UI (后台语义)。
+     */
+    AUTH_REQUIRED("AUTH_REQUIRED", "Vault 需要一次用户验证后才能自动签名"),
     NO_WALLET_KEY("NO_WALLET_KEY", "Vault 中没有该应用的钱包密钥, 请先初始化钱包"),
+    /**
+     * v3.76.0 · P0 身份轮换专用: 该应用尚无身份密钥 (无法轮换"不存在"的密钥)。
+     *
+     * Engine 收到后应先走 identityinit (首次绑定), 再提供 rotate 选项。
+     */
+    NO_IDENTITY_KEY("NO_IDENTITY_KEY", "Vault 中没有该应用的身份密钥, 请先完成身份绑定"),
     TX_FORMAT_ERROR("TX_FORMAT_ERROR", "交易载荷格式错误, 无法解析"),
     TX_SEQ_REJECTED("TX_SEQ_REJECTED", "交易序号未超过高水位 (检测到账本回滚), 拒绝签名"),
     // ---- v3.39: 赠金幂等 + 单账户合并 ----
@@ -233,7 +246,15 @@ data class IpcSignRequest(
  * 生成, Engine 侧不提供任何种子材料 (杜绝弱熵注入)。
  */
 data class IpcWalletInitRequest(
-    val sessionId: String
+    val sessionId: String,
+    /**
+     * v3.50: 强制独立指纹 (forceauth=1)。
+     *
+     * 引导流语义: 身份绑定 (第一次指纹) 与钱包初始化 (第二次指纹) 是
+     * 两个独立安全事件; true 时 Vault 先撤销该应用的 30s 授权缓存,
+     * WalletInitActivity 必弹指纹而非静默通过。
+     */
+    val forceAuth: Boolean = false
 ) {
     companion object {
         /** 从 Intent 解析钱包初始化请求 */
@@ -246,7 +267,34 @@ data class IpcWalletInitRequest(
         fun fromUri(uri: Uri): IpcWalletInitRequest? {
             if (!IpcContract.isWalletInitUri(uri)) return null
             val sessionId = uri.getQueryParameter(IpcContract.PARAM_SESSION) ?: return null
-            return IpcWalletInitRequest(sessionId)
+            val forceAuth = uri.getQueryParameter(IpcContract.PARAM_FORCE_AUTH) == "1"
+            return IpcWalletInitRequest(sessionId, forceAuth)
+        }
+    }
+}
+
+/**
+ * v3.72 · P1-1 身份密钥初始化请求 (identityinit)。
+ *
+ * 与 [IpcWalletInitRequest] 同构但无 forceAuth —— 身份绑定是引导流
+ * 第一步 (此前无授权缓存可静默), 天然必弹指纹。结构校验仅路由字段;
+ * 密钥生成在 Vault 侧, 无 payload。
+ */
+data class IpcIdentityInitRequest(
+    val sessionId: String
+) {
+    companion object {
+        /** 从 Intent 解析身份初始化请求 */
+        fun fromIntent(intent: Intent): IpcIdentityInitRequest? {
+            val uri = intent.data ?: return null
+            return fromUri(uri)
+        }
+
+        /** 从 URI 解析身份初始化请求 */
+        fun fromUri(uri: Uri): IpcIdentityInitRequest? {
+            if (!IpcContract.isIdentityInitUri(uri)) return null
+            val sessionId = uri.getQueryParameter(IpcContract.PARAM_SESSION) ?: return null
+            return IpcIdentityInitRequest(sessionId)
         }
     }
 }
@@ -603,5 +651,72 @@ data class IpcWalletSyncRequest(
             }
             return chain
         }
+    }
+}
+
+/**
+ * v3.76.0 · P0 身份密钥轮换请求 (identityrotate)。
+ *
+ * 从 myvault://identityrotate URI 解析而来。与 [IpcIdentityInitRequest]
+ * 同构但语义不同:
+ * - **非幂等**: 每次调用触发真正的密钥轮换 (非"已有则返回");
+ * - **强制生物识别**: Vault 侧忽略 AuthGrantCache, 始终弹指纹/面容;
+ * - **回调双结果**: 成功时 result 为 JSON, 包含新公钥 + 旧密钥签署的
+ *   轮换声明 (见 [IpcIdentityRotateResponse])。
+ *
+ * 仅含路由字段 (sessionId), 无载荷 Extra —— 轮换材料全部在 Vault TEE 内生成。
+ */
+data class IpcIdentityRotateRequest(
+    val sessionId: String
+) {
+    companion object {
+        /** 从 Intent 解析身份轮换请求 */
+        fun fromIntent(intent: Intent): IpcIdentityRotateRequest? {
+            val uri = intent.data ?: return null
+            return fromUri(uri)
+        }
+
+        /** 从 URI 解析身份轮换请求 */
+        fun fromUri(uri: Uri): IpcIdentityRotateRequest? {
+            if (!IpcContract.isIdentityRotateUri(uri)) return null
+            val sessionId = uri.getQueryParameter(IpcContract.PARAM_SESSION) ?: return null
+            return IpcIdentityRotateRequest(sessionId)
+        }
+    }
+}
+
+/**
+ * v3.76.0 · P0 身份轮换回调结果 (identityrotate 成功回调的 result 载荷)。
+ *
+ * Vault 完成身份轮换后经回调 result 返回 Engine。Engine:
+ * 1. 用 newPublicKey 替换本地绑定公钥 (BoundIdentityStore + SessionManager);
+ * 2. 将 rotationStatement 通过 E2E MSG/SIGNAL 通道传播给聊天对方;
+ * 3. 对方收到后验证旧签名 → 更新联系人公钥 (PersistentContactStore)。
+ *
+ * 全部字段为 Base64 编码的非秘密材料 (公钥 + 签名声明), 回调泄露
+ * 不影响私钥安全 —— 私钥全程未离开 Vault TEE。
+ *
+ * @param newPublicKey      新身份公钥 (X.509 DER Base64)
+ * @param rotationStatement 旧私钥签署的 IdentityRotationStatement (Base64)
+ * @param subIdentityCredential 主 DID 签发的子身份凭证 (Base64, 可空 — 主 DID 未初始化时无)
+ */
+@kotlinx.serialization.Serializable
+data class IpcIdentityRotateResponse(
+    val newPublicKey: String,
+    val rotationStatement: String,
+    val subIdentityCredential: String? = null
+) {
+    companion object {
+        private val json = kotlinx.serialization.json.Json {
+            ignoreUnknownKeys = true
+            encodeDefaults = true
+        }
+
+        fun encode(response: IpcIdentityRotateResponse): String =
+            json.encodeToString(serializer(), response)
+
+        fun decode(s: String): IpcIdentityRotateResponse? = runCatching {
+            json.decodeFromString(serializer(), s)
+        }.getOrNull()
     }
 }

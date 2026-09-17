@@ -43,7 +43,11 @@
 | 组件间回调 | 回调签名覆盖 sessionId+status+ts+result，防调包 | `IpcContract` |
 | Engine↔Vault 直连 | v3.40 Binder 通道：signature 权限保护绑定（仅同证书双端可连）、事务描述符字节级一致、回调经 Binder 直送（免跨应用跳转弹窗）、旧 Activity 通道自动回退 | `VaultIpcBinder` |
 | Spark 计费协议 | SPARK-V1 域分离 HTTP 签名（fp‖ts‖nonce‖SHA-256(body)）、计量常量（1KB=10 SPARK、每日赠金 1,000）、错误码与请求模型 | `SparkLedger` |
-| 本地钱包 | append-only 签名交易账本：交易规范化序列化（字段定序）、域分离签名（SPARK-WALLET-TX-V1，与身份签名域不可互换）、prevTxHash 哈希链、余额=历史推导值、全链验签（重放/回退/断链检出） | `WalletTx` / `WalletLedger` |
+| 本地钱包 | append-only 签名交易账本：交易规范化序列化（字段定序）、域分离签名（SPARK-WALLET-TX-V1，与身份签名域不可互换）、prevTxHash 哈希链、余额=历史推导值、全链验签（重放/回退/断链检出）、增量校验（v3.59 消除整链重验 O(n²)）、并发原子化（互斥锁） | `WalletTx` / `WalletLedger` |
+| 双花防护 | v3.74 盲化探针 `DupProbe`：SHA256(域‖SHA256(钱包公钥)‖u64(seq))，不可逆不可链接；经独立不认证端点认领（三态 granted=true/false/null） | `DupProbe` / `ProtocolSerializer` |
+| 身份轮换 | v3.73 旧子身份私钥签发「授权接班人」声明，v3.76 主 DID 私钥签发「子身份派生」凭证；验证者凭主公钥验签 | `IdentityRotationStatement` / `SubIdentityCredential` |
+| 离线投递 | v3.53 中继离线队列（MSG_ACK 三态 queued/delivered/rejected），v3.56 群消息 backlog 托管冲刷 | `MessageEnvelope` / `ProtocolSerializer` |
+| 涂鸦墙 | v3.56~v3.81 公开留言面：卡片（≤300 词元、≤90KB 配图）、留言（≤100 词元、同卡同指纹限 1 条）、浏览量（按指纹去重）、分页翻阅（GRAFFITI_PAGE_END/MORE） | `MessageEnvelope` / `SparkLedger` |
 
 ## 数据驻留（隐私红线）
 

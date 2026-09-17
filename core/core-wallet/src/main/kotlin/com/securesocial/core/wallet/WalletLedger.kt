@@ -53,10 +53,34 @@ class WalletLedger(private val walletPublicKey: PublicKey) {
     private val ecdsa = EcdsaOperations()
 
     private val _txs = mutableListOf<WalletTx>()
-    val txs: List<WalletTx> get() = _txs.toList()
+    val txs: List<WalletTx> get() = synchronized(lock) { _txs.toList() }
+
+    // ── v3.59 增量校验状态 (修复: 同步延迟随链长恶化, 逐笔追赶 O(n²)) ──
+    //
+    // 背景: 旧实现对账时每轮做整链重验 —— Vault 权威侧 walletState 每轮
+    // 全链 verify, Engine 镜像每 appendTx 一次又对完整前缀链全量重验
+    // (appendTx 内部 verify(extended))。链一笔笔增长后, 逐笔追赶 N 笔退化为
+    // 近似 O(n·N), 即 "同步钱包延迟 / 杀几次进程才对齐" 的区块侧根因。
+    //
+    // 本字段维护"已验证前缀"的游标与累计余额: appendTx / balances 只做
+    // 增量 (验新一笔), 不再从第 0 笔重跑。链语义逐字节不变 (签名域、
+    // prevTxHash 链接、HANDOVER/GENESIS 规则原样保留), 不引入任何 checkpoint
+    // 信任折损 —— 前缀在进程内仅由本对象 append 演进, 无可被外部篡改的面;
+    // 初次装载 / full 全链重建仍走全量 verify (见 [verify] / [load])。
+    private var verifiedCount = 0
+    private var runningBalance = WalletBalances(0, 0)
+
+    /**
+     * 内部互斥锁 (修复 B-1): 使 "校验 → 追加 → 游标 → 余额" 的写路径
+     * 与 `balances/nextSeq/isTerminal` 等读路径原子化, 杜绝并发 append
+     * 导致的断链/游标与 _txs 不同步。JVM 内建锁重入, append/balances
+     * 嵌套调用安全。
+     */
+    private val lock = Any()
 
     /** 当前账本健康状态 */
     var status: Status = Status.CLEAN
+        get() = synchronized(lock) { field }
         private set
 
     enum class Status {
@@ -69,6 +93,7 @@ class WalletLedger(private val walletPublicKey: PublicKey) {
 
     /** 校验失败原因 (日志/UI 用; 不含敏感材料) */
     var tamperReason: String? = null
+        get() = synchronized(lock) { field }
         private set
 
     sealed class ChainCheck {
@@ -85,13 +110,23 @@ class WalletLedger(private val walletPublicKey: PublicKey) {
      * 装载持久化账本 (宿主在启动时调用): 逐条校验后装载。
      * 任何一条违规 → TAMPERED (已通过的前缀保留为只读证据)。
      */
-    fun load(existing: List<WalletTx>): ChainCheck {
+    fun load(existing: List<WalletTx>): ChainCheck = synchronized(lock) {
         val check = verify(existing)
         _txs.clear()
         _txs.addAll(existing)
         status = if (check is ChainCheck.Ok) Status.CLEAN else Status.TAMPERED
         tamperReason = if (check is ChainCheck.Bad) check.reason else null
-        return check
+        // 增量游标同步: Ok → 整链已验, 后续 append 只增量验新一笔;
+        // Bad → 保守置 0 (balances() 回退全量 fold, appendTx 因 TAMPERED 拒绝,
+        // 只读证据语义不变)。
+        if (check is ChainCheck.Ok) {
+            verifiedCount = existing.size
+            runningBalance = check.balances
+        } else {
+            verifiedCount = 0
+            runningBalance = WalletBalances(0, 0)
+        }
+        check
     }
 
     /**
@@ -101,87 +136,116 @@ class WalletLedger(private val walletPublicKey: PublicKey) {
         if (chain.isEmpty()) return ChainCheck.Ok(0, WalletBalances(0, 0))
 
         var prev: WalletTx? = null
-        var custody = 0L
-        var margin = 0L
+        var running = WalletBalances(0, 0)
         for ((index, tx) in chain.withIndex()) {
             val at = "tx[$index seq=${tx.seq}]"
-
-            if (tx.amount <= 0) return ChainCheck.Bad("$at amount<=0")
-
-            if (prev == null) {
-                if (tx.seq < 1L) return ChainCheck.Bad("$at first tx seq<1")
-                if (tx.prevTxHash.isNotEmpty()) return ChainCheck.Bad("$at first tx prevTxHash!=''")
-                if (tx.type == TxType.HANDOVER)
-                    return ChainCheck.Bad("$at HANDOVER cannot be first (no custody to hand over)")
-            } else {
-                if (tx.seq <= prev.seq)
-                    return ChainCheck.Bad("$at seq regression (expect >${prev.seq})")
-                if (tx.prevTxHash != prev.txHash)
-                    return ChainCheck.Bad("$at prevTxHash link broken")
-                if (prev.type == TxType.GENESIS && tx.type == TxType.GENESIS)
-                    return ChainCheck.Bad("$at duplicate GENESIS")
-                if (prev.type == TxType.HANDOVER)
-                    return ChainCheck.Bad("$at tx after terminal HANDOVER")
+            when (val one = validateOne(tx, prev, running, isFirst = index == 0)) {
+                is OneCheck.Bad -> return ChainCheck.Bad("$at ${one.reason}")
+                is OneCheck.Ok -> running = one.balances
             }
-
-            when (tx.type) {
-                TxType.GRANT ->
-                    if (!tx.counterparty.isNullOrEmpty())
-                        return ChainCheck.Bad("$at GRANT must have no counterparty")
-                else -> Unit
-            }
-            if (tx.type == TxType.GENESIS && index != 0)
-                return ChainCheck.Bad("$at GENESIS not first")
-
-            // 签名校验 (规范化字节, 域分离)
-            val sig = runCatching { Base64.getDecoder().decode(tx.signature) }
-                .getOrElse { return ChainCheck.Bad("$at signature not base64") }
-            if (!ecdsa.verify(walletPublicKey, TxCanonical.bytes(tx), sig))
-                return ChainCheck.Bad("$at signature invalid")
-
-            // 交接语义: 全额移交 (残留即死账 —— 其后不可再有任何交易)
-            if (tx.type == TxType.HANDOVER) {
-                if (tx.counterparty.isNullOrBlank())
-                    return ChainCheck.Bad("$at HANDOVER must name new pubkey (counterparty)")
-                val totalAtPoint = custody + margin
-                // v3.39: 全额移交 total; 兼容旧链 amount == custody (margin 不迁移)
-                if (tx.amount != totalAtPoint && tx.amount != custody)
-                    return ChainCheck.Bad(
-                        "$at HANDOVER amount ${tx.amount} != total $totalAtPoint (must drain fully)",
-                    )
-            }
-
-            val eff = tx.effects()
-            custody += eff.custody
-            margin += eff.margin
-
-            // v3.39 足额规则: 总额运行余额恒非负
-            // (v3.38 旧链两分量各自非负 → total 必然非负, 升级兼容)
-            val totalNow = custody + margin
-            if (totalNow < 0L) return ChainCheck.Bad("$at total overdrawn ($totalNow)")
-
             prev = tx
         }
-        return ChainCheck.Ok(chain.size, WalletBalances(custody, margin))
+        return ChainCheck.Ok(chain.size, running)
+    }
+
+    /** 单笔校验结果 (增量 append 与全量 [verify] 共用, 规则单点不漂移) */
+    private sealed class OneCheck {
+        data class Ok(val balances: WalletBalances) : OneCheck()
+        data class Bad(val reason: String) : OneCheck()
+    }
+
+    /**
+     * 校验单笔交易相对其前一笔 ([prev]) 的合法性, 返回累计余额。
+     *
+     * [startBalances] 为 [prev] 之后 (已验证前缀) 的累计效果。校验规则
+     * 与历史 [verify] 逐笔分支完全一致 —— 增量 append (见 [appendTx])
+     * 借此只验新一笔、避免整链重验, 而规则保持单一来源。
+     */
+    private fun validateOne(
+        tx: WalletTx,
+        prev: WalletTx?,
+        startBalances: WalletBalances,
+        isFirst: Boolean,
+    ): OneCheck {
+        if (tx.amount <= 0) return OneCheck.Bad("amount<=0")
+
+        if (prev == null) {
+            if (tx.seq < 1L) return OneCheck.Bad("first tx seq<1")
+            if (tx.prevTxHash.isNotEmpty()) return OneCheck.Bad("first tx prevTxHash!=''")
+            if (tx.type == TxType.HANDOVER)
+                return OneCheck.Bad("HANDOVER cannot be first (no custody to hand over)")
+        } else {
+            if (tx.seq <= prev.seq)
+                return OneCheck.Bad("seq regression (expect >${prev.seq})")
+            if (tx.prevTxHash != prev.txHash)
+                return OneCheck.Bad("prevTxHash link broken")
+            if (prev.type == TxType.GENESIS && tx.type == TxType.GENESIS)
+                return OneCheck.Bad("duplicate GENESIS")
+            if (prev.type == TxType.HANDOVER)
+                return OneCheck.Bad("tx after terminal HANDOVER")
+        }
+
+        when (tx.type) {
+            TxType.GRANT ->
+                if (!tx.counterparty.isNullOrEmpty())
+                    return OneCheck.Bad("GRANT must have no counterparty")
+            else -> Unit
+        }
+        if (tx.type == TxType.GENESIS && !isFirst)
+            return OneCheck.Bad("GENESIS not first")
+
+        // 签名校验 (规范化字节, 域分离)
+        val sig = runCatching { Base64.getDecoder().decode(tx.signature) }
+            .getOrElse { return OneCheck.Bad("signature not base64") }
+        if (!ecdsa.verify(walletPublicKey, TxCanonical.bytes(tx), sig))
+            return OneCheck.Bad("signature invalid")
+
+        var custody = startBalances.custody
+        var margin = startBalances.margin
+
+        // 交接语义: 全额移交 (残留即死账 —— 其后不可再有任何交易)
+        if (tx.type == TxType.HANDOVER) {
+            if (tx.counterparty.isNullOrBlank())
+                return OneCheck.Bad("HANDOVER must name new pubkey (counterparty)")
+            val totalAtPoint = custody + margin
+            // v3.39: 全额移交 total; 兼容旧链 amount == custody (margin 不迁移)
+            if (tx.amount != totalAtPoint && tx.amount != custody)
+                return OneCheck.Bad(
+                    "HANDOVER amount ${tx.amount} != total $totalAtPoint (must drain fully)",
+                )
+        }
+
+        val eff = tx.effects()
+        custody += eff.custody
+        margin += eff.margin
+
+        // v3.39 足额规则: 总额运行余额恒非负
+        // (v3.38 旧链两分量各自非负 → total 必然非负, 升级兼容)
+        val totalNow = custody + margin
+        if (totalNow < 0L) return OneCheck.Bad("total overdrawn ($totalNow)")
+
+        return OneCheck.Ok(WalletBalances(custody, margin))
     }
 
     // ---- 余额与链接材料 ----
 
     /** 双账户余额 = Σ effects (推导值; TAMPERED 状态下仍可查看但不许支出) */
-    fun balances(): WalletBalances =
-        _txs.fold(WalletBalances(0, 0)) { acc, tx -> acc + tx.effects() }
+    fun balances(): WalletBalances = synchronized(lock) {
+        if (verifiedCount == _txs.size) runningBalance
+        else _txs.fold(WalletBalances(0, 0)) { acc, tx -> acc + tx.effects() }
+    }
 
     /** 可用余额 (v3.39 合并语义) = custody + margin */
     fun balance(): Long = balances().total
 
-    fun nextSeq(): Long = (_txs.lastOrNull()?.seq ?: 0L) + 1L
+    fun nextSeq(): Long = synchronized(lock) { (_txs.lastOrNull()?.seq ?: 0L) + 1L }
 
-    fun nextPrevHash(): String = _txs.lastOrNull()?.txHash ?: ""
+    fun nextPrevHash(): String = synchronized(lock) { _txs.lastOrNull()?.txHash ?: "" }
 
-    fun isEmpty(): Boolean = _txs.isEmpty()
+    fun isEmpty(): Boolean = synchronized(lock) { _txs.isEmpty() }
 
     /** 链是否已终结 (最后一笔为 HANDOVER —— 不可再追加任何交易) */
-    fun isTerminal(): Boolean = _txs.lastOrNull()?.type == TxType.HANDOVER
+    fun isTerminal(): Boolean = synchronized(lock) { _txs.lastOrNull()?.type == TxType.HANDOVER }
 
     // ---- 足额预检 (权威记账方签名前调用) ----
 
@@ -195,17 +259,33 @@ class WalletLedger(private val walletPublicKey: PublicKey) {
      * 追加一笔已签名交易: 追加前以全链视角校验 (前缀 + 新交易),
      * 保证账本内永远只有可验证历史。TAMPERED 状态拒绝追加。
      */
-    fun appendTx(tx: WalletTx): ChainCheck {
+    fun appendTx(tx: WalletTx): ChainCheck = synchronized(lock) {
         if (status == Status.TAMPERED)
-            return ChainCheck.Bad("ledger tampered: append rejected")
+            return@synchronized ChainCheck.Bad("ledger tampered: append rejected")
         if (isTerminal())
-            return ChainCheck.Bad("ledger terminal (HANDOVER): append rejected")
+            return@synchronized ChainCheck.Bad("ledger terminal (HANDOVER): append rejected")
+        // 前缀必须已全量验证 (load 或前次 append 之后), 增量校验才成立;
+        // 否则回退整链重验 (理论仅 TAMPERED 前的异常态可达)。
+        if (verifiedCount != _txs.size) {
+            val extended = _txs + tx
+            val check = verify(extended)
+            if (check is ChainCheck.Bad) return@synchronized check
+            val ok = check as ChainCheck.Ok
+            _txs.add(tx)
+            verifiedCount = _txs.size
+            runningBalance = ok.balances
+            return@synchronized ChainCheck.Ok(_txs.size, runningBalance)
+        }
 
-        val extended = _txs + tx
-        val check = verify(extended)
-        if (check is ChainCheck.Bad) return check
-
-        _txs.add(tx)
-        return ChainCheck.Ok(_txs.size, balances())
+        // v3.59 增量路径: 只验新一笔 (规则与 [verify] 单一来源)
+        when (val one = validateOne(tx, _txs.lastOrNull(), runningBalance, isFirst = _txs.isEmpty())) {
+            is OneCheck.Bad -> return@synchronized ChainCheck.Bad(one.reason)
+            is OneCheck.Ok -> {
+                _txs.add(tx)
+                verifiedCount++
+                runningBalance = one.balances
+                return@synchronized ChainCheck.Ok(_txs.size, runningBalance)
+            }
+        }
     }
 }
