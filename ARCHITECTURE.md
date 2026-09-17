@@ -38,7 +38,7 @@
 | 会话密钥协商 | 每会话 ECDH（P-256）+ HKDF，公钥交换带身份签名防 MITM | `EcdhKeyAgreement` |
 | 消息加密 | AES-256-GCM，AAD 绑定双方指纹 + 序列号（防跨会话/跨身份重放） | `AesGcmCipher` / `MessageEnvelope` |
 | 中继认证 | 挑战-应答（Vault 内签名），私钥不出设备 | `SignalAuth` |
-| 密钥流转 | 密钥对导入导出序列化（跨设备迁移） | `KeyPayloadSerializer` |
+| 身份密钥流转 | 密钥零出口（v3.72+）：身份密钥在 Vault TEE 内生成/轮换且不可导出（identityinit/identityrotate），Engine 全程只见公钥；`KeyPayloadSerializer` 仅对旧版 Vault 迁移码保留「导入兼容」通道（导出侧已删除） | `KeyPayloadSerializer` / `IdentityRotationStatement` / `SubIdentityCredential` |
 | 本地备份 | PBKDF2-HMAC-SHA256（350k 迭代）口令派生 + AES-256-GCM，明文头入 AAD | `BackupFormat` / `BackupPayload` |
 | 组件间回调 | 回调签名覆盖 sessionId+status+ts+result，防调包 | `IpcContract` |
 | Engine↔Vault 直连 | v3.40 Binder 通道：signature 权限保护绑定（仅同证书双端可连）、事务描述符字节级一致、回调经 Binder 直送（免跨应用跳转弹窗）、旧 Activity 通道自动回退 | `VaultIpcBinder` |

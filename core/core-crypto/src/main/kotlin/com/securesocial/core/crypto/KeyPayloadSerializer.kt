@@ -18,6 +18,14 @@ import java.util.Base64
  * 安全约束:
  * - URI Scheme 中绝对禁止携带私钥明文
  * - 私钥仅通过此二维码光学通道传递
+ *
+ * ⚠️ v3.72 起角色收缩（密钥零出口）：
+ * 本序列化器承载私钥 QR 载荷，仅对【旧版 Vault 迁移码】保留**导入兼容**
+ * 通道（v3.70 及以前导出的迁移码仍可导入；导出侧 exportBinding 已删除）。
+ * 产品当前身份密钥走 **identityinit / identityrotate**——在 Vault TEE 内
+ * 生成/轮换且不可导出，Engine 全程只见公钥，本序列化器不在新路径中使用。
+ * 若新产品审计中关注私钥流向，请以 identityinit/identityrotate 与
+ * BackupFormat（私钥零出 Vault）为当前态；本文件属兼容性遗留。
  */
 object KeyPayloadSerializer {
 

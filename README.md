@@ -10,7 +10,7 @@ License: **AGPL-3.0** · 快照版本: **v3.82.0-audit**
 
 | 模块 | 内容 | 测试 |
 |---|---|---|
-| `core/core-crypto` | AES-256-GCM 封装（IV 纳入 AAD 三方绑定）、P-256 ECDSA 签名/验签、ECDH 密钥协商、SHA-256 密钥指纹、中继挑战-应答（SignalAuth）、密钥导入导出序列化、本地备份容器格式（PBKDF2 + AES-GCM）、双花探针（v3.74 `DupProbe`，不可逆不可链接盲化指纹）、身份轮换声明（v3.73）、子身份凭证（v3.76 主 DID 派生） | 7 套 |
+| `core/core-crypto` | AES-256-GCM 封装（IV 纳入 AAD 三方绑定）、P-256 ECDSA 签名/验签、ECDH 密钥协商、SHA-256 密钥指纹、中继挑战-应答（SignalAuth）、身份密钥零出口（v3.72+：identityinit/identityrotate，TEE 内生成/轮换且不可导出，Engine 只见公钥；`KeyPayloadSerializer` 仅对旧版迁移码保留导入兼容）、本地备份容器格式（PBKDF2 + AES-GCM）、双花探针（v3.74 `DupProbe`，不可逆不可链接盲化指纹）、身份轮换声明（v3.73）、子身份凭证（v3.76 主 DID 派生） | 7 套 |
 | `core/core-protocol` | 消息信封线协议（AAD 绑定双方指纹+序列号防重放）、协议序列化、Spark 账本协议（SPARK-V1 HTTP 签名内容、计量常量、错误码与请求模型）、领金日去重帧（v3.45：`GRANT_CHECK`/`GRANT_ACK`，不可链接设备日哈希）、离线投递队列（v3.53 `MSG_ACK`/`QUEUE_FULL`）、群消息离线托管 backlog（v3.56）、涂鸦墙（v3.56~v3.81：卡片/留言/浏览量/分页翻阅）、双花认领（v3.74 `DUP_CLAIM`/`DUP_CLAIM_RESULT` 三态） | 1 套 |
 | `core/core-ipc` | Engine↔Vault 签名回调契约（回调签名规则、错误码、防篡改；钱包密钥初始化/交易签名/总额足额校验/账本对账摘要/全链拉取（full=1）/每日赠金幂等标记/交接承接请求契约）、v3.40 Binder 直连通道契约（事务描述符逐字节一致、signature 权限保护绑定、回调注册表、旧 Activity 跳转通道回退）、v3.51 静默签名入口、v3.72 权威账本恢复（walletrestore）、v3.76 身份密钥初始化与轮换（identityinit/identityrotate） | 1 套 |
 | `core/core-wallet` | 本地签名账本：交易模型与规范化序列化、域分离签名（SPARK-WALLET-TX-V1）、append-only 哈希链、单一可用余额推导（total，v3.39 合并双账户；旧链 custody/margin 分量仍可推导）、全链验签（重放/回退/断链检出）、钱包交接协议（HANDOVER 终结交易 + 交接证书 + 承接 GENESIS）、增量校验（v3.59，消除整链重验 O(n²)）、并发原子化（B-1 互斥锁）、来源归属（v3.49 `source` 审计展示列） | 1 套 |
