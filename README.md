@@ -1,99 +1,69 @@
 # Engine 3.0 — E2EE Protocol Stack (Public Audit Edition)
 
-> Engine E2EE 通信产品的**协议栈公开审计版**。产品客户端与基础设施
-> 闭源，端到端加密层在此开源，接受社区审计——加密闭源没有意义，
-> **可验证性才是安全的来源**（Signal 模式）。
+[中文](./README.zh-CN.md)
 
-License: **AGPL-3.0** · 快照版本: **v3.82.0-audit**
+> The end-to-end encryption protocol stack of the Engine messaging product, published for public audit. The product clients and infrastructure remain closed-source; the crypto layer is open, because **closed-source cryptography is meaningless — verifiability is where security comes from** (the Signal model).
 
-## 本仓库包含什么
+| | |
+|---|---|
+| License | **AGPL-3.0** |
+| Snapshot | **v3.82.0-audit** |
+| Language | Kotlin (pure JVM) + one Android contract module |
+| Build | JDK 17; Android SDK (platform 34) required for `core-ipc` only |
+| Tests | `./gradlew test` → **10 suites / 164 assertions, all green** |
 
-| 模块 | 内容 | 测试 |
+## What's in this repo
+
+| Module | Contents | Tests |
 |---|---|---|
-| `core/core-crypto` | AES-256-GCM 封装（IV 纳入 AAD 三方绑定）、P-256 ECDSA 签名/验签、ECDH 密钥协商、SHA-256 密钥指纹、中继挑战-应答（SignalAuth）、身份密钥零出口（v3.72+：identityinit/identityrotate，TEE 内生成/轮换且不可导出，Engine 只见公钥；`KeyPayloadSerializer` 仅对旧版迁移码保留导入兼容）、本地备份容器格式（PBKDF2 + AES-GCM）、双花探针（v3.74 `DupProbe`，不可逆不可链接盲化指纹）、身份轮换声明（v3.73）、子身份凭证（v3.76 主 DID 派生） | 7 套 |
-| `core/core-protocol` | 消息信封线协议（AAD 绑定双方指纹+序列号防重放）、协议序列化、Spark 账本协议（SPARK-V1 HTTP 签名内容、计量常量、错误码与请求模型）、领金日去重帧（v3.45：`GRANT_CHECK`/`GRANT_ACK`，不可链接设备日哈希）、离线投递队列（v3.53 `MSG_ACK`/`QUEUE_FULL`）、群消息离线托管 backlog（v3.56）、涂鸦墙（v3.56~v3.81：卡片/留言/浏览量/分页翻阅）、双花认领（v3.74 `DUP_CLAIM`/`DUP_CLAIM_RESULT` 三态） | 1 套 |
-| `core/core-ipc` | Engine↔Vault 签名回调契约（回调签名规则、错误码、防篡改；钱包密钥初始化/交易签名/总额足额校验/账本对账摘要/全链拉取（full=1）/每日赠金幂等标记/交接承接请求契约）、v3.40 Binder 直连通道契约（事务描述符逐字节一致、signature 权限保护绑定、回调注册表、旧 Activity 跳转通道回退）、v3.51 静默签名入口、v3.72 权威账本恢复（walletrestore）、v3.76 身份密钥初始化与轮换（identityinit/identityrotate） | 1 套 |
-| `core/core-wallet` | 本地签名账本：交易模型与规范化序列化、域分离签名（SPARK-WALLET-TX-V1）、append-only 哈希链、单一可用余额推导（total，v3.39 合并双账户；旧链 custody/margin 分量仍可推导）、全链验签（重放/回退/断链检出）、钱包交接协议（HANDOVER 终结交易 + 交接证书 + 承接 GENESIS）、增量校验（v3.59，消除整链重验 O(n²)）、并发原子化（B-1 互斥锁）、来源归属（v3.49 `source` 审计展示列） | 1 套 |
+| `core/core-crypto` | AES-256-GCM envelopes (IV bound into AAD, three-way binding) · P-256 ECDSA sign/verify · ECDH key agreement · SHA-256 key fingerprints · relay challenge–response (SignalAuth) · **zero-export identity keys** (v3.72+: `identityinit`/`identityrotate` — generated and rotated inside the TEE, never exportable; the client only ever sees public keys; `KeyPayloadSerializer` retains import compatibility for legacy migration code only) · local backup container format (PBKDF2 + AES-GCM) · double-spend probe (v3.74 `DupProbe` — irreversible, unlinkable blinded fingerprints) · identity-rotation statements (v3.73) · sub-identity credentials (v3.76, derived from the main DID) | 7 suites |
+| `core/core-protocol` | message-envelope wire protocol (AAD binds both fingerprints + sequence number → anti-replay) · protocol serialization · SPARK ledger protocol (SPARK-V1 signed HTTP content, metering constants, error codes and request models) · daily fuel-subsidy dedupe frames (v3.45: `GRANT_CHECK`/`GRANT_ACK` — unlinkable per-day device hashes) · offline delivery queue (v3.53 `MSG_ACK`/`QUEUE_FULL`) · group-message offline backlog (v3.56) · message wall (v3.56–v3.81: cards/messages/view counts/pagination) · double-spend claims (v3.74 `DUP_CLAIM`/`DUP_CLAIM_RESULT`, three-state) | 1 suite |
+| `core/core-ipc` | Engine↔Vault signed-callback contract (callback signature rules, error codes, anti-tampering; wallet key init / transaction signing / total-amount sufficiency checks / ledger reconciliation summary / full-chain pull (`full=1`) / daily fuel idempotence marker / handover-acceptance request contract) · v3.40 Binder direct channel (byte-identical transaction descriptors, signature-permission-protected binding, callback registry, automatic fallback to the legacy activity-hop channel) · v3.51 silent signing entry · v3.72 authoritative ledger restore (`walletrestore`) · v3.76 identity key init and rotation (`identityinit`/`identityrotate`) | 1 suite |
+| `core/core-wallet` | local signed ledger: transaction model and canonical serialization · domain-separated signing (SPARK-WALLET-TX-V1) · append-only hash chain · single spendable-balance derivation (total; v3.39 merged the dual accounts — legacy chains still derive custody/margin components) · full-chain verification (detects replay, rollback, broken chains) · wallet handover protocol (HANDOVER terminal transaction + handover certificate + GENESIS acceptance on the new device) · incremental verification (v3.59 — eliminates O(n²) full-chain re-verification) · concurrency atomicity (B-1 mutex) · source attribution (v3.49 `source` audit column) | 1 suite |
 
-构建要求：**JDK 17**；`core-ipc` 是 Android 契约模块（基于
-`Intent`/`Uri`），需 **Android SDK (platform 34)**，其余模块纯 JVM：
+## Build and test
 
 ```bash
-./gradlew test         # 运行全部 10 套测试 / 164 断言全绿
+./gradlew test
 ```
 
-## 不包含什么（以及为什么）
+`core-ipc` is the only Android-dependent module (it is a contract module built on `Intent`/`Uri`); everything else is pure JVM.
 
-| 排除项 | 理由 |
+## Security model at a glance
+
+- **Zero-knowledge server** — the relay sees only ciphertext and fingerprint prefixes; replacing or compromising it yields no plaintext.
+- **Private keys never leave the device** — identity keys are generated and used inside a hardware keystore (Android Keystore/TEE); every operation in this stack touches public keys only.
+- **Per-session forward secrecy** — ephemeral ECDH; key exchange is identity-signed to stop MITM substitution.
+- **Zero message persistence** — clients do not store chat messages (data minimization on top of E2EE).
+- **Local backup** — password-derived keys (PBKDF2-HMAC-SHA256, 350k iterations) + AES-256-GCM; the file header is bound into AAD against tampering.
+- **Local wallet** — the balance is a *derived* value, not a stored number: an append-only, domain-separated signed transaction history where tampering, deletion, or reordering of any record breaks the hash chain and is caught by full-chain verification. The balance never touches a server, never enters a backup file.
+- **Single spendable balance (v3.39)** — custody/margin accounts merged into one total; sufficiency checks and balance derivation always use the total, enforced by the keystore-side authoritative ledger (prevents blind-signing and overspending). Legacy dual-account transfers net to zero against the total, so no existing signed chain breaks on upgrade; a high-water sequence number blocks old-backup replays.
+- **Authoritative full reconciliation (v3.39)** — `full=1` full-chain pull rebuilds a local mirror from the authoritative ledger after reinstall or fork, ending rejection loops caused by sequence desync.
+- **Daily fuel-subsidy idempotence (v3.39)** — issuance follows the authoritative ledger; the reconciliation response carries the day's GRANT idempotence marker, so reinstalling the client cannot double-claim.
+- **Wallet handover (v3.38)** — device migration with zero private-key copies: the old key signs a HANDOVER terminal transaction transferring the full balance (v3.39+: the total; the old chain can sign nothing afterward); the new device verifies the handover certificate and accepts via GENESIS. The certificate binds the new public key inside the old key's signature — no substitution.
+- **Binder IPC direct channel (v3.40)** — Engine↔Vault communication upgraded from cross-app activity hops to a signature-permission-protected Binder channel (some ROMs show a confirmation dialog on every cross-app hop — twice per signing round on the old channel). The cryptographic contract is unchanged (callback signatures, result inside the signature scope); only the transport changed. The legacy channel remains as automatic fallback, so both apps can upgrade independently.
+- **Daily dedupe (v3.45)** — subsidy anti-abuse without any account system: before claiming, the client sends `GRANT_CHECK(h, day)` over an authenticated connection, where `h = SHA-256("spark-grant-dedupe/1" ‖ day ‖ deviceSeed)` is an **unlinkable** per-day device hash (days cannot be correlated with each other; the relay cannot track a device across days). The relay atomically checks-and-occupies the day's set and answers `GRANT_ACK(allowed)`. The device seed prefers a TEE/DRM-derived value (stable across reinstalls of the same package name); after local memory is wiped, the relay is the only external memory that an uninstall cannot kill. Defense in depth: amount whitelist (`WalletGrant.DAILY_GRANT_AMOUNT`) and a "memo must equal the signing side's current day" gate (clock-skew sealing).
+- **Deployment boundary (v3.45.4)** — the relay's dedupe set is in-process memory; anti-abuse assumes **single-instance deployment** — multiple instances require `h`-sharded routing first (design finalized in [ARCHITECTURE.md](ARCHITECTURE.md)); scale vertically before considering instances.
+
+Full architecture and trust-domain breakdown: [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## What is NOT here (and why)
+
+| Excluded | Reason |
 |---|---|
-| Android 客户端 / 密钥库 App | 产品实现，闭源 |
-| 中继服务 relay-server | 商业私有化交付物；且中继**零状态**（只转发密文，不存储任何用户数据），其安全性不依赖源码保密 |
-| 服务端账本设计 | 未部署的商业设计 |
-| 部署手册 / 运维文档 | 内部资产 |
+| Android clients / key-vault app | product implementations, closed-source |
+| relay-server | commercial private deployment deliverable; the relay is **stateless** (forwards ciphertext only, stores no user data), so its security does not depend on source secrecy |
+| server-side ledger design | undisclosed commercial design |
+| deployment/ops documentation | internal assets |
 
-## 安全模型速览
+## Delivery form
 
-- **零知识服务端**：中继只见密文与指纹前缀，换掉/攻破中继得不到任何明文
-- **私钥不出设备**：身份私钥由独立的硬件密钥库（Android Keystore/TEE）
-  保管，签名在密钥库内完成，本协议栈中的所有操作只接触公钥
-- **每会话前向保密**：ECDH 临时密钥协商，公钥交换带身份签名防中间人
-- **消息零落盘**：客户端不持久化聊天消息（E2EE 之上再加一层数据最小化）
-- **本地备份**：口令派生密钥（PBKDF2-HMAC-SHA256, 350k 迭代）+
-  AES-256-GCM，文件头纳入 AAD 防篡改
-- **本地钱包**：余额不是存储的数字，而是 append-only 签名交易历史的
-  推导值——每笔交易由密钥库内的钱包密钥做域分离签名，篡改/删除/
-  重排任何历史记录都会破坏哈希链而被全链验签检出；钱包余额既不
-  上服务端，也不进备份文件
-- **单一可用余额（v3.39）**：托管/可用双账户合并为统一的可用余额
-  （total = custody + margin）——足额校验与余额推导一律取总额，由
-  密钥库侧权威账本做总额足额校验（防盲签/防超支）；旧链上的双账户
-  划转交易对 total 效果为 0，升级不破坏任何已签链；高水位序号挡旧
-  备份重放
-- **权威链全量对账（v3.39）**：账本对账摘要支持 `full=1` 全链拉取——
-  客户端重装/清数据后本地镜像为空，或镜像与权威链分叉时，一次对账
-  即完成全量重建（全链验签后整体替换本地镜像），从根上终结序号
-  失步导致的拒绝循环
-- **每日赠金幂等（v3.39）**：赠金发放以权威账本为准——对账应答携带
-  当日 GRANT 幂等标记，客户端卸载重装不再重复领取
-- **钱包交接（v3.38）**：换机迁移零私钥拷贝——旧密钥签署 HANDOVER
-  终结交易移交全部余额（v3.39 起为 total 全额；此后旧链不可再续签），
-  新机凭交接证书验证旧密钥签名后以 GENESIS 承接；交接证书防调包
-  （新公钥绑定于旧密钥签名之内）
-- **Binder IPC 直连（v3.40）**：Engine↔Vault 通信从跨应用跳转升级为
-  signature 级权限保护的 Binder 直连通道——绑定行为不触发任何用户
-  确认弹窗（部分 ROM 对跨应用跳转一律弹确认框，旧通道每轮签名要弹
-  2 次，静默对账轮询时尤甚）；请求经 Binder 投递、回调经 Binder 直送
-  Engine 进程。密码学契约原样复用（回调验签、result 纳入签名范围），
-  只换投递方式不弱化安全；旧 Activity 跳转通道保留为自动回退，
-  双端可独立升级
-- **领金日去重（v3.45）**：每日赠金的防滥用不依赖任何账号体系——
-  客户端在领取前经已认证连接发送 `GRANT_CHECK(h, day)`，其中
-  `h = SHA-256("spark-grant-dedupe/1" ‖ day ‖ deviceSeed)` 为**不可
-  链接**设备日哈希（不同日互不可关联，中继无法跨日追踪设备），
-  中继当日集合原子查并占后回 `GRANT_ACK(allowed)`。设备种子优先
-  取 TEE/DRM 派生值（同包名重装不变），注册卸载清空等本地记忆
-  全灭后，中继是唯一卸载杀不死的外部记忆点。客户端侧另有金额
-  白名单（`WalletGrant.DAILY_GRANT_AMOUNT`）与"memo 必须 == 签名端
-  当日"门槛（时钟偏移封堵）作纵深防线
-- **部署边界（v3.45.4 入档）**：中继去重表为进程内存态，防滥用
-  效果以**单实例部署**为前提——多实例须先实施 `h` 分片路由
-  （设计定稿见 [ARCHITECTURE.md](ARCHITECTURE.md) 部署拓扑边界），
-  否则去重效果随实例数稀释；容量不足先垂直扩容
+This repository targets protocol audit: it contains the protocol stack source and tests only, no deployment materials — the operations of security infrastructure cannot be condensed into a single install command. The product ships as cloud apps and commercial private deployments; building and running it yourself under AGPL-3.0 is outside product support scope.
 
-架构与信任域划分详见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+## Reporting vulnerabilities
 
-## 交付形态
+**Do not report security issues via public GitHub issues.** Use the private channel; process and bounty tiers are in [SECURITY.md](SECURITY.md). Breaks of the E2EE cryptographic layer (T1) receive the highest severity.
 
-本仓库面向协议审计，仅含协议栈源码与测试，不含部署物料——
-安全基础设施的运维无法浓缩为一条安装命令。产品以云端应用与
-商业私有化方案交付；依 AGPL-3.0 自行构建运行不在产品支持范围内。
+## Disclaimer
 
-## 漏洞报告
-
-**请勿通过公开 issue 报告安全漏洞。** 请走私密通道，流程与赏金
-分级见 [SECURITY.md](SECURITY.md)。E2EE 密码学层破坏（T1）享有
-最高等级。
-
-## 免责声明
-
-本仓库按"现状"提供，不构成生产就绪承诺，不含任何担保。
+This repository is provided as-is; it is not a production-readiness promise and carries no warranty.
