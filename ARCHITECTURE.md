@@ -1,76 +1,86 @@
-# 架构总览
+# Architecture Overview · [中文版](ARCHITECTURE.zh-CN.md)
 
-## 组件拓扑（产品全景，本仓库只含阴影部分）
+## Component topology (full product; this repository contains only the shaded part)
 
 ```
-┌───────────────────────── Android 设备 ─────────────────────────┐
-│  ┌──────────┐  Binder 直连 (v3.40)     ┌──────────┐            │
-│  │  Engine   │◄── 挑战/签名请求 ────────│  Vault   │            │
-│  │  客户端   │─── 回调(Binder+签名) ───►│ 密钥库   │            │
-│  │ (闭源)    │   [旧: signature 级 IPC]  │ (闭源)   │            │
-│  └────┬─────┘                          └────┬─────┘            │
-│       │ 会话/群组密钥(内存)                   │ Keystore/TEE     │
-└───────┼──────────────────────────────────────┼──────────────────┘
-        │ TLS + E2EE 密文                  │ 无任何网络权限(物理隔离)
-        ▼                                  ▼
-┌──────────────┐
-│ 中继 relay    │  无消息状态哑管道 · 只转发密文 · 闭源(商业私有化交付物)
-└──────────────┘
-
-  ▓▓ 本仓库 ▓▓ = core-crypto / core-protocol / core-ipc / core-wallet
-  （客户端与密钥库共同依赖的协议栈，两侧字节级同步）
+┌───────────────────────── Android device ───────────────────────┐
+│  ┌──────────┐   Binder direct channel (v3.40)   ┌──────────┐   │
+│  │  Engine   │◄── challenge / sign requests ────│  Vault   │   │
+│  │  client   │─── callbacks (Binder + sig) ────►│ key vault│   │
+│  │ (closed)  │   [legacy: signature-level IPC]  │ (closed) │   │
+│  └────┬─────┘                                   └────┬─────┘   │
+│       │ session/group keys (memory only)             │ Keystore/TEE
+└───────┼──────────────────────────────────────────────┼─────────┘
+        │ TLS + E2EE ciphertext                        │ zero network
+        ▼                                              ▼ permission
+┌──────────────┐                                        (physical
+│ relay server  │  stateless pipe for messages ·        isolation)
+└──────────────┘  forwards ciphertext only · closed (commercial)
 ```
 
-## 信任域划分
+  ▓▓ This repository ▓▓ = core-crypto / core-protocol / core-ipc / core-wallet
+  (the protocol stack both clients depend on; byte-identical on both sides)
 
-| 域 | 信任假设 | 失守后果 |
-|---|---|---|
-| Vault（含 TEE） | 唯一信任锚 | 私钥泄露 = 身份冒用 |
-| 客户端进程内存 | 本机可信 | 会话密钥泄露 = 在场消息可解（重启即清） |
-| 中继运营方 | **零信任** | 只见密文与指纹前缀，无法解密、无法画像 |
-| 网络 | 敌意 | TLS 防流量窥探，E2EE 防中继作恶 |
+## Trust-domain partitioning
 
-## 密码学栈（全部在本仓库）
+| Domain | Trust assumption | If compromised |
+| --- | --- | --- |
+| Vault (incl. TEE) | The only trust anchor | Private key leak = identity forgery |
+| Client process memory | Device itself trusted | Session key leak = in-session messages decryptable (cleared on restart) |
+| Relay operator | **Zero trust** | Sees only ciphertext + fingerprint prefixes; can neither decrypt nor profile |
+| Network | Hostile | TLS against traffic inspection; E2EE against a malicious relay |
 
-| 能力 | 构成 | 代码入口 |
-|---|---|---|
-| 身份 | P-256 ECDSA；SHA-256 指纹（前 16B）为节点 ID | `EcdsaOperations` / `KeyFingerprint` |
-| 会话密钥协商 | 每会话 ECDH（P-256）+ HKDF，公钥交换带身份签名防 MITM | `EcdhKeyAgreement` |
-| 消息加密 | AES-256-GCM，AAD 绑定双方指纹 + 序列号（防跨会话/跨身份重放） | `AesGcmCipher` / `MessageEnvelope` |
-| 中继认证 | 挑战-应答（Vault 内签名），私钥不出设备 | `SignalAuth` |
-| 身份密钥流转 | 密钥零出口（v3.72+）：身份密钥在 Vault TEE 内生成/轮换且不可导出（identityinit/identityrotate），Engine 全程只见公钥；`KeyPayloadSerializer` 仅对旧版 Vault 迁移码保留「导入兼容」通道（导出侧已删除） | `KeyPayloadSerializer` / `IdentityRotationStatement` / `SubIdentityCredential` |
-| 本地备份 | PBKDF2-HMAC-SHA256（350k 迭代）口令派生 + AES-256-GCM，明文头入 AAD | `BackupFormat` / `BackupPayload` |
-| 组件间回调 | 回调签名覆盖 sessionId+status+ts+result，防调包 | `IpcContract` |
-| Engine↔Vault 直连 | v3.40 Binder 通道：signature 权限保护绑定（仅同证书双端可连）、事务描述符字节级一致、回调经 Binder 直送（免跨应用跳转弹窗）、旧 Activity 通道自动回退 | `VaultIpcBinder` |
-| Spark 计费协议 | SPARK-V1 域分离 HTTP 签名（fp‖ts‖nonce‖SHA-256(body)）、计量常量（1KB=10 SPARK、每日赠金 1,000）、错误码与请求模型 | `SparkLedger` |
-| 本地钱包 | append-only 签名交易账本：交易规范化序列化（字段定序）、域分离签名（SPARK-WALLET-TX-V1，与身份签名域不可互换）、prevTxHash 哈希链、余额=历史推导值、全链验签（重放/回退/断链检出）、增量校验（v3.59 消除整链重验 O(n²)）、并发原子化（互斥锁） | `WalletTx` / `WalletLedger` |
-| 双花防护 | v3.74 盲化探针 `DupProbe`：SHA256(域‖SHA256(钱包公钥)‖u64(seq))，不可逆不可链接；经独立不认证端点认领（三态 granted=true/false/null） | `DupProbe` / `ProtocolSerializer` |
-| 身份轮换 | v3.73 旧子身份私钥签发「授权接班人」声明，v3.76 主 DID 私钥签发「子身份派生」凭证；验证者凭主公钥验签 | `IdentityRotationStatement` / `SubIdentityCredential` |
-| 离线投递 | v3.53 中继离线队列（MSG_ACK 三态 queued/delivered/rejected），v3.56 群消息 backlog 托管冲刷 | `MessageEnvelope` / `ProtocolSerializer` |
-| 涂鸦墙 | v3.56~v3.81 公开留言面：卡片（≤300 词元、≤90KB 配图）、留言（≤100 词元、同卡同指纹限 1 条）、浏览量（按指纹去重）、分页翻阅（GRAFFITI_PAGE_END/MORE） | `MessageEnvelope` / `SparkLedger` |
+## Cryptography stack (entirely in this repository)
 
-## 数据驻留（隐私红线）
+| Capability | Construction | Entry point |
+| --- | --- | --- |
+| Identity | P-256 ECDSA; SHA-256 fingerprint (first 16 B) as node ID | `EcdsaOperations` / `KeyFingerprint` |
+| Session key agreement | Per-session ECDH (P-256) + HKDF; public-key exchange identity-signed against MITM | `EcdhKeyAgreement` |
+| Message encryption | AES-256-GCM; AAD binds both fingerprints + sequence number (blocks cross-session / cross-identity replay) | `AesGcmCipher` / `MessageEnvelope` |
+| Relay authentication | Challenge–response (signed inside Vault); private key never leaves the device | `SignalAuth` |
+| Identity key lifecycle | Zero key export (v3.72+): identity keys generated/rotated inside the Vault TEE and not exportable (`identityinit`/`identityrotate`); Engine only ever sees public keys. `KeyPayloadSerializer` keeps an *import-compat* channel only for legacy Vault migration codes (export side removed) | `KeyPayloadSerializer` / `IdentityRotationStatement` / `SubIdentityCredential` |
+| Local backup | PBKDF2-HMAC-SHA256 (350k iterations) password-derived key + AES-256-GCM; cleartext header in AAD | `BackupFormat` / `BackupPayload` |
+| Cross-app callbacks | Callback signature covers sessionId+status+ts+result — tamper-evident | `IpcContract` |
+| Engine↔Vault direct link | v3.40 Binder channel: signature-permission-protected binding (only same-certificate endpoints connect), byte-exact transaction descriptors, callbacks delivered over Binder (no cross-app activity dialogs), automatic fallback to the legacy Activity channel | `VaultIpcBinder` |
+| SPARK billing protocol | SPARK-V1 domain-separated HTTP signature (fp‖ts‖nonce‖SHA-256(body)), metering constants (1 KB = 10 SPARK, daily grant 1,000), error codes & request models | `SparkLedger` |
+| Local wallet | Append-only signed transaction ledger: canonical serialization (fixed field order), domain-separated signatures (`SPARK-WALLET-TX-V1`, not interchangeable with the identity signature domain), `prevTxHash` chain, balance = derivation over history, full-chain verification (replay/rollback/chain-break detection), incremental verification (v3.59, removes O(n²) re-verification), concurrency atomization (mutex) | `WalletTx` / `WalletLedger` |
+| Double-spend defense | v3.74 blinded probe `DupProbe`: SHA256(domain‖SHA256(wallet pubkey)‖u64(seq)), irreversible & unlinkable; claimed via a separate unauthenticated endpoint (three-state granted=true/false/null) | `DupProbe` / `ProtocolSerializer` |
+| Identity rotation | v3.73: the retiring sub-identity private key signs an "authorized successor" statement; v3.76: the master DID key signs sub-identity derivation credentials; verifiers check against the master public key | `IdentityRotationStatement` / `SubIdentityCredential` |
+| Offline delivery | v3.53 relay offline queue (`MSG_ACK`, three-state queued/delivered/rejected); v3.56 group backlog custody & flush | `MessageEnvelope` / `ProtocolSerializer` |
+| Graffiti wall | v3.56–v3.81 public message surface: cards (≤300 tokens, ≤90 KB image), comments (≤100 tokens, one per fingerprint per card), view counts (fingerprint-deduped), paging (`GRAFFITI_PAGE_END/MORE`) | `MessageEnvelope` / `SparkLedger` |
 
-| 数据 | 驻留位置 |
-|---|---|
-| 聊天消息 | 仅内存，零落盘 |
-| 联系人 / 标记物 | 仅本地；备份走用户自持加密文件（`BackupFormat`） |
-| SPARK 余额 | 仅本地签名账本（`core-wallet`）：余额 = 签名历史推导值，不进备份文件、不上服务端 |
-| 身份私钥 | 仅密钥库，Keystore 加密 |
-| 服务端 | 无任何用户数据；SPARK 计费余额不上服务端（避免以指纹索引的交易图谱） |
+## Data residency (privacy red lines)
 
-## 部署拓扑边界（领金日去重的诚实声明）
+| Data | Where it lives |
+| --- | --- |
+| Chat messages | Memory only, never on disk |
+| Contacts / markers | Local only; backups go into a user-held encrypted file (`BackupFormat`) |
+| SPARK balance | Local signed ledger only (`core-wallet`): balance = derivation over signed history; never in backup files, never on the server |
+| Identity private keys | Key vault only, Keystore-encrypted |
+| Server side | No user data of any kind; SPARK billing balances stay off the server (avoids a fingerprint-indexed transaction graph) |
 
-「无消息状态」不等于「无状态」：中继进程内存持有三张表——连接注册表
-（指纹→会话）、群扇出订阅表、领金日去重表（day→不可链接哈希集）。
-三者均为进程内存态、不落盘。**领金日去重的防滥用效果以单实例部署为
-前提**：若多实例水平扩展而不加分片，各实例去重记忆独立，同一设备
-重装后轮询实例即可多次领取（滥用收益 ∝ 实例数）。
+## Deployment topology boundary (an honest note on daily-grant dedupe)
 
-已定稿的分片设计（实施前禁止多实例扩容）：`h` 由客户端本地计算
-（连接建立前已知），领金核验走独立短连接，URL 携带 `h` 首 hex 字符
-（16 桶），L7 负载均衡按桶一致性路由——同一设备同一天恒落同一实例，
-去重语义不因实例数稀释，且不引入任何共享存储（零落盘红线不破）。
-容量不足时的合规路径是垂直扩容（单实例升配，三表天然全局一致）。
-审计视角：任何声称"多实例部署下赠金防滥用仍完整"的说法，都应
-先核实分片是否已实施。
+"No message state" does not mean "no state": the relay process holds three
+in-memory tables — a connection registry (fingerprint → session), a group
+fan-out subscription table, and a daily-grant dedupe table
+(day → set of unlinkable hashes). All three are process-memory only and never
+touch disk. **The anti-abuse guarantee of the daily-grant dedupe assumes
+single-instance deployment**: with naive horizontal scaling, each instance
+keeps an independent dedupe memory, and a reinstalled device can poll
+instances to claim multiple grants (abuse yield ∝ number of instances).
+
+The finalized sharding design (must be implemented *before* any
+multi-instance scale-out): `h` is computed client-side (known before the
+connection is established); grant verification runs over a separate
+short-lived connection whose URL carries the first hex character of `h`
+(16 buckets); the L7 load balancer routes consistently per bucket — the same
+device on the same day always lands on the same instance, dedupe semantics do
+not dilute with instance count, and no shared storage is introduced (the
+zero-on-disk red line stays intact). The compliant path when capacity runs
+out is vertical scaling (bigger single instance; the three tables are
+naturally globally consistent there).
+
+Audit perspective: any claim that "grant anti-abuse remains intact under
+multi-instance deployment" should first be checked against whether this
+sharding has actually been implemented.

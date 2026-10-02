@@ -1,99 +1,85 @@
 # Engine 3.0 — E2EE Protocol Stack (Public Audit Edition)
 
-> Engine E2EE 通信产品的**协议栈公开审计版**。产品客户端与基础设施
-> 闭源，端到端加密层在此开源，接受社区审计——加密闭源没有意义，
-> **可验证性才是安全的来源**（Signal 模式）。
+> The open protocol & cryptography layer of the Engine E2EE messaging products.
+> Product clients and infrastructure are closed-source; the end-to-end encryption
+> layer is published here for public audit — closed-source cryptography is
+> meaningless, **verifiability is where security comes from** (the Signal model).
 
-License: **AGPL-3.0** · 快照版本: **v3.82.0-audit**
+**License: AGPL-3.0** · Snapshot: **v3.82.0-audit** · [中文文档](README.zh-CN.md)
 
-## 本仓库包含什么
+**What "public audit edition" means:** this repository is published for open,
+community-driven review. It has **not** undergone a formal third-party audit —
+closing that gap is exactly what this repo is for.
 
-| 模块 | 内容 | 测试 |
-|---|---|---|
-| `core/core-crypto` | AES-256-GCM 封装（IV 纳入 AAD 三方绑定）、P-256 ECDSA 签名/验签、ECDH 密钥协商、SHA-256 密钥指纹、中继挑战-应答（SignalAuth）、身份密钥零出口（v3.72+：identityinit/identityrotate，TEE 内生成/轮换且不可导出，Engine 只见公钥；`KeyPayloadSerializer` 仅对旧版迁移码保留导入兼容）、本地备份容器格式（PBKDF2 + AES-GCM）、双花探针（v3.74 `DupProbe`，不可逆不可链接盲化指纹）、身份轮换声明（v3.73）、子身份凭证（v3.76 主 DID 派生） | 7 套 |
-| `core/core-protocol` | 消息信封线协议（AAD 绑定双方指纹+序列号防重放）、协议序列化、Spark 账本协议（SPARK-V1 HTTP 签名内容、计量常量、错误码与请求模型）、领金日去重帧（v3.45：`GRANT_CHECK`/`GRANT_ACK`，不可链接设备日哈希）、离线投递队列（v3.53 `MSG_ACK`/`QUEUE_FULL`）、群消息离线托管 backlog（v3.56）、涂鸦墙（v3.56~v3.81：卡片/留言/浏览量/分页翻阅）、双花认领（v3.74 `DUP_CLAIM`/`DUP_CLAIM_RESULT` 三态） | 1 套 |
-| `core/core-ipc` | Engine↔Vault 签名回调契约（回调签名规则、错误码、防篡改；钱包密钥初始化/交易签名/总额足额校验/账本对账摘要/全链拉取（full=1）/每日赠金幂等标记/交接承接请求契约）、v3.40 Binder 直连通道契约（事务描述符逐字节一致、signature 权限保护绑定、回调注册表、旧 Activity 跳转通道回退）、v3.51 静默签名入口、v3.72 权威账本恢复（walletrestore）、v3.76 身份密钥初始化与轮换（identityinit/identityrotate） | 1 套 |
-| `core/core-wallet` | 本地签名账本：交易模型与规范化序列化、域分离签名（SPARK-WALLET-TX-V1）、append-only 哈希链、单一可用余额推导（total，v3.39 合并双账户；旧链 custody/margin 分量仍可推导）、全链验签（重放/回退/断链检出）、钱包交接协议（HANDOVER 终结交易 + 交接证书 + 承接 GENESIS）、增量校验（v3.59，消除整链重验 O(n²)）、并发原子化（B-1 互斥锁）、来源归属（v3.49 `source` 审计展示列） | 1 套 |
+**Snapshot policy:** this repo tracks the protocol layer of the shipping
+products and may lag the product version (currently synced to Engine v3.82).
 
-构建要求：**JDK 17**；`core-ipc` 是 Android 契约模块（基于
-`Intent`/`Uri`），需 **Android SDK (platform 34)**，其余模块纯 JVM：
+## What's in this repository
+
+| Module | Contents | Tests |
+| --- | --- | --- |
+| `core/core-crypto` | AES-256-GCM envelope (IV bound into AAD, three-way binding), P-256 ECDSA sign/verify, ECDH key agreement, SHA-256 key fingerprints, relay challenge–response (SignalAuth), zero-export identity keys (v3.72+: `identityinit`/`identityrotate` — generated and rotated inside the TEE, not exportable; Engine only ever sees public keys; `KeyPayloadSerializer` retains import-compatibility only for legacy migration codes), local backup container format (PBKDF2 + AES-GCM), double-spend probe (v3.74 `DupProbe`, irreversible & unlinkable blinded fingerprint), identity-rotation statements (v3.73), sub-identity credentials (v3.76, derived from a master DID) | 7 suites |
+| `core/core-protocol` | Message-envelope wire protocol (AAD binds both fingerprints + sequence number, preventing cross-session / cross-identity replay), protocol serialization, SPARK billing protocol (SPARK-V1 HTTP-signed content, metering constants, error codes, request models), daily-grant dedup frames (v3.45: `GRANT_CHECK`/`GRANT_ACK`, unlinkable per-day device hashes), offline delivery queue (v3.53 `MSG_ACK`/`QUEUE_FULL`), group-message backlog custody (v3.56), graffiti wall (v3.56–v3.81: cards / messages / view counts / paging), double-spend claims (v3.74 `DUP_CLAIM`/`DUP_CLAIM_RESULT`, three-state) | 1 suite |
+| `core/core-ipc` | Engine↔Vault signing-callback contract (callback signature rules, error codes, tamper-proofing; wallet key init / transaction signing / sufficiency checks / ledger reconciliation digest / full-chain pull (`full=1`) / daily-grant idempotence marker / handover acceptance contract), v3.40 Binder direct-channel contract (byte-exact transaction descriptors, signature-permission-protected binding, callback registry, legacy Activity-channel fallback), v3.51 silent-signing entry, v3.72 authoritative ledger restore (`walletrestore`), v3.76 identity key init & rotation | 1 suite |
+| `core/core-wallet` | Local signed ledger: transaction model & canonical serialization, domain-separated signatures (`SPARK-WALLET-TX-V1`), append-only hash chain, single available-balance derivation (v3.39 merged the dual custody/margin accounts into `total`), full-chain verification (replay / rollback / chain-break detection), wallet handover protocol (HANDOVER terminal tx + handover certificate + GENESIS acceptance), incremental verification (v3.59, removes O(n²) full-chain re-verification), concurrency atomization (B-1 mutex), source attribution (v3.49) | 1 suite |
+
+## Build & verify
+
+Requirements: **JDK 17**. `core-ipc` is an Android contract module
+(Intent/Uri-based) and additionally needs the **Android SDK (platform 34)**;
+the other three modules are pure JVM:
 
 ```bash
-./gradlew test         # 运行全部 10 套测试 / 164 断言全绿
+./gradlew test    # 10 suites / 147 test cases — expected: all green
 ```
 
-## 不包含什么（以及为什么）
+The pure-JVM modules (crypto / protocol / wallet) also build and test green
+on a stock OpenJDK 17 without any Android tooling.
 
-| 排除项 | 理由 |
-|---|---|
-| Android 客户端 / 密钥库 App | 产品实现，闭源 |
-| 中继服务 relay-server | 商业私有化交付物；且中继**零状态**（只转发密文，不存储任何用户数据），其安全性不依赖源码保密 |
-| 服务端账本设计 | 未部署的商业设计 |
-| 部署手册 / 运维文档 | 内部资产 |
+## What is NOT here (and why)
 
-## 安全模型速览
+| Excluded | Reason |
+| --- | --- |
+| Android clients / key-vault app | Product implementations, closed-source |
+| Relay server (`relay-server`) | Commercial private-deployment deliverable; the relay keeps **no user data at rest** (it forwards ciphertext only), so its security does not depend on source secrecy. Residual in-memory state and its deployment constraints are documented honestly in [ARCHITECTURE.md](ARCHITECTURE.md) |
+| Server-side ledger design | Undeployed commercial design |
+| Deployment / ops documentation | Internal assets |
 
-- **零知识服务端**：中继只见密文与指纹前缀，换掉/攻破中继得不到任何明文
-- **私钥不出设备**：身份私钥由独立的硬件密钥库（Android Keystore/TEE）
-  保管，签名在密钥库内完成，本协议栈中的所有操作只接触公钥
-- **每会话前向保密**：ECDH 临时密钥协商，公钥交换带身份签名防中间人
-- **消息零落盘**：客户端不持久化聊天消息（E2EE 之上再加一层数据最小化）
-- **本地备份**：口令派生密钥（PBKDF2-HMAC-SHA256, 350k 迭代）+
-  AES-256-GCM，文件头纳入 AAD 防篡改
-- **本地钱包**：余额不是存储的数字，而是 append-only 签名交易历史的
-  推导值——每笔交易由密钥库内的钱包密钥做域分离签名，篡改/删除/
-  重排任何历史记录都会破坏哈希链而被全链验签检出；钱包余额既不
-  上服务端，也不进备份文件
-- **单一可用余额（v3.39）**：托管/可用双账户合并为统一的可用余额
-  （total = custody + margin）——足额校验与余额推导一律取总额，由
-  密钥库侧权威账本做总额足额校验（防盲签/防超支）；旧链上的双账户
-  划转交易对 total 效果为 0，升级不破坏任何已签链；高水位序号挡旧
-  备份重放
-- **权威链全量对账（v3.39）**：账本对账摘要支持 `full=1` 全链拉取——
-  客户端重装/清数据后本地镜像为空，或镜像与权威链分叉时，一次对账
-  即完成全量重建（全链验签后整体替换本地镜像），从根上终结序号
-  失步导致的拒绝循环
-- **每日赠金幂等（v3.39）**：赠金发放以权威账本为准——对账应答携带
-  当日 GRANT 幂等标记，客户端卸载重装不再重复领取
-- **钱包交接（v3.38）**：换机迁移零私钥拷贝——旧密钥签署 HANDOVER
-  终结交易移交全部余额（v3.39 起为 total 全额；此后旧链不可再续签），
-  新机凭交接证书验证旧密钥签名后以 GENESIS 承接；交接证书防调包
-  （新公钥绑定于旧密钥签名之内）
-- **Binder IPC 直连（v3.40）**：Engine↔Vault 通信从跨应用跳转升级为
-  signature 级权限保护的 Binder 直连通道——绑定行为不触发任何用户
-  确认弹窗（部分 ROM 对跨应用跳转一律弹确认框，旧通道每轮签名要弹
-  2 次，静默对账轮询时尤甚）；请求经 Binder 投递、回调经 Binder 直送
-  Engine 进程。密码学契约原样复用（回调验签、result 纳入签名范围），
-  只换投递方式不弱化安全；旧 Activity 跳转通道保留为自动回退，
-  双端可独立升级
-- **领金日去重（v3.45）**：每日赠金的防滥用不依赖任何账号体系——
-  客户端在领取前经已认证连接发送 `GRANT_CHECK(h, day)`，其中
-  `h = SHA-256("spark-grant-dedupe/1" ‖ day ‖ deviceSeed)` 为**不可
-  链接**设备日哈希（不同日互不可关联，中继无法跨日追踪设备），
-  中继当日集合原子查并占后回 `GRANT_ACK(allowed)`。设备种子优先
-  取 TEE/DRM 派生值（同包名重装不变），注册卸载清空等本地记忆
-  全灭后，中继是唯一卸载杀不死的外部记忆点。客户端侧另有金额
-  白名单（`WalletGrant.DAILY_GRANT_AMOUNT`）与"memo 必须 == 签名端
-  当日"门槛（时钟偏移封堵）作纵深防线
-- **部署边界（v3.45.4 入档）**：中继去重表为进程内存态，防滥用
-  效果以**单实例部署**为前提——多实例须先实施 `h` 分片路由
-  （设计定稿见 [ARCHITECTURE.md](ARCHITECTURE.md) 部署拓扑边界），
-  否则去重效果随实例数稀释；容量不足先垂直扩容
+## Security model at a glance
 
-架构与信任域划分详见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+- **Zero-knowledge server**: the relay sees only ciphertext and fingerprint
+  prefixes; replacing or compromising it yields no plaintext
+- **Private keys never leave the device**: identity keys are held by a
+  dedicated hardware key vault (Android Keystore/TEE); signing happens inside
+  the vault, and every operation in this stack touches public keys only
+- **Per-session forward secrecy**: ECDH ephemeral key agreement; the public-key
+  exchange is identity-signed against MITM
+- **Zero message persistence**: clients never write chat messages to disk
+  (data minimization on top of E2EE)
+- **Local backups**: password-derived keys (PBKDF2-HMAC-SHA256, 350k
+  iterations) + AES-256-GCM, cleartext header bound into AAD against tampering
+- **Local wallet**: balances are not stored numbers but derivations over an
+  append-only signed transaction history — every transaction is signed inside
+  the key vault with domain separation; tampering, deletion or reordering
+  breaks the hash chain and is caught by full-chain verification. Balances
+  never go to the server and never enter backup files
+- **Honest limits**: "no message state" is not "no state" — the relay process
+  holds three in-memory tables (connection registry, group fan-out
+  subscriptions, daily-grant dedupe). The dedupe table's anti-abuse guarantee
+  assumes **single-instance deployment**; see
+  [ARCHITECTURE.md](ARCHITECTURE.md) for the sharding design that must be
+  implemented before any multi-instance scale-out
 
-## 交付形态
+Full trust-domain partitioning: [ARCHITECTURE.md](ARCHITECTURE.md).
+Audit starting points per concern: [SECURITY.md](SECURITY.md).
 
-本仓库面向协议审计，仅含协议栈源码与测试，不含部署物料——
-安全基础设施的运维无法浓缩为一条安装命令。产品以云端应用与
-商业私有化方案交付；依 AGPL-3.0 自行构建运行不在产品支持范围内。
+## Reporting vulnerabilities
 
-## 漏洞报告
+**Do not report security vulnerabilities via public issues.** Use the private
+channel described in [SECURITY.md](SECURITY.md). Breaks of the E2EE crypto
+layer (T1) carry the highest bounty tier.
 
-**请勿通过公开 issue 报告安全漏洞。** 请走私密通道，流程与赏金
-分级见 [SECURITY.md](SECURITY.md)。E2EE 密码学层破坏（T1）享有
-最高等级。
+## Disclaimer
 
-## 免责声明
-
-本仓库按"现状"提供，不构成生产就绪承诺，不含任何担保。
+This repository is provided as-is. It is not a production-readiness
+commitment and carries no warranty.
